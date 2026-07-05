@@ -1,46 +1,58 @@
-# Veri Transfer Konsolu (Python + PySide6)
+# File Transfer Console
 
-PowerShell/WinForms surumunun Python'a tam donusumu.
+A Python implementation of the PowerShell/WinForms file transfer tool using PySide6.
 
-## Kurulum (gelistirme/calistirma)
+## Features
 
-```
+- GUI and CLI modes
+- Scheduled task support via Windows Task Scheduler
+- Robocopy-based transfer engine
+- Hash verification and logging
+- Credential storage support
+- Single-file EXE packaging with PyInstaller
+
+## Development and Run
+
+```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-## Tek EXE'ye derleme
+## Build to a Single EXE
 
-```
+```bash
 python build_exe.py
 ```
 
-Cikti: `dist/TransferConsole.exe` — TEK dosya, baska hicbir dosyaya
-(psm1, ayri ps1 script) ihtiyac duymaz.
+Output: dist/TransferConsole.exe
 
-## Gorev Zamanlayici (Scheduled Task) kullanimi
+## Scheduled Task Usage
 
-GUI icindeki "Zamanla" butonu otomatik olarak asagidaki komutu kaydeder:
+The GUI "Schedule" action creates a scheduled task similar to:
 
+```powershell
+TransferConsole.exe --run-job "JobName" --config "C:\ProgramData\DataTransferTool\jobs.json"
 ```
-TransferConsole.exe --run-job "JobAdi" --config "C:\ProgramData\DataTransferTool\jobs.json"
-```
 
-## Dosya Yapisi
+## Project Structure
 
-```
-main.py                  Giris noktasi (GUI + CLI mod)
+```text
+main.py                  Entry point (GUI + CLI)
 engine/
-  config.py               Job konfigurasyonu (jobs.json) - atomic yazma + yedekleme
-  transfer.py             Robocopy + hash dogrulama + disk kontrolu ana motoru
-  credentials.py          DPAPI (Windows) ile kimlik bilgisi saklama + SMB pre-auth
-  scheduler.py            Windows Gorev Zamanlayici (schtasks) entegrasyonu
-  logutil.py              Log yazimi, disk bilgisi, hash log uretimi
+  config.py              Job configuration (jobs.json) with atomic write + backup
+  transfer.py            Transfer engine with Robocopy, hashing, disk checks
+  credentials.py         Credential storage with DPAPI (Windows) + SMB pre-auth
+  scheduler.py           Windows Task Scheduler integration
+  logutil.py             Logging, disk info, hash log generation
 gui/
-  main_window.py          Ana pencere (job listesi + canli log)
-  job_editor.py           Yeni/Duzenle job dialog'u
-  cred_manager.py         Kimlik bilgisi yoneticisi dialog'u
-build_exe.py              PyInstaller derleme scripti
+  main_window.py         Main window UI
+  job_editor.py          Add/Edit job dialog
+  cred_manager.py        Credential manager dialog
+build_exe.py             PyInstaller build script
 requirements.txt
 ```
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
