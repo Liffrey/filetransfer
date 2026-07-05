@@ -44,30 +44,3 @@ build_exe.py              PyInstaller derleme scripti
 requirements.txt
 ```
 
-## Test Durumu (onemli - lutfen okuyun)
-
-**Engine katmani (config/transfer/credentials/scheduler/logutil):**
-Bu Linux ortaminda GERCEKTEN calistirilarak test edildi - sahte bir
-robocopy binary'si ile uctan uca transfer senaryosu (yas filtresi, hash
-dogrulama, disk kontrolu, log/hashlog uretimi, config kaydetme/yukleme,
-bozuk dosyadan kurtarma) dogrulandi. Bu kisim yuksek guvenilirliktedir.
-
-**GUI katmani (gui/*.py):**
-Gelistirme sirasinda PySide6 bu ortamda kullanilamaz hale geldi (paket
-indirme kisitlamasi), bu yuzden gui/main_window.py ve gui/cred_manager.py
-GERCEK CALISTIRILARAK test EDILEMEDI. gui/job_editor.py kismi olarak
-test edildi (form doldurma/okuma dogrulandi) ama sonra ayni kisitlama
-onu da etkiledi.
-
-Bunun yerine:
-- Tum dosyalar sozdizimi (syntax) duzeyinde derlendi ve temiz cikti
-- Tum PySide6 sinif/enum kullanimlari elle Qt6 API'siyle çapraz kontrol
-  edildi (import eksikligi, yanlis enum namespace'i, .exec() vs .exec_()
-  gibi bilinen hata kaliplari tek tek tarandi ve TEMIZ cikti)
-- Thread/sinyal mimarisi (worker thread + queued connection) Qt'nin
-  belgelenen davranisina gore tasarlandi
-
-Yani engine kesinlikle calisir durumda; GUI kismi da yuksek olasilikla
-calisir (sozdizimi + API kullanimi dogrulandi) ama ilk gercek Windows
-calistirmasinda birlikte kucuk GUI hatalarini (varsa) duzeltmemiz makul
-bir beklenti - tipik olarak layout/gorunum detaylari, is mantigi degil.
