@@ -21,9 +21,22 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
+def _python_executable() -> str:
+    """Use the workspace venv interpreter when present; otherwise fall back to the current interpreter."""
+    candidates = [
+        HERE / ".venv" / "Scripts" / "python.exe",
+        HERE / ".venv" / "bin" / "python",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
 def main():
+    python_exe = _python_executable()
     args = [
-        sys.executable, "-m", "PyInstaller",
+        python_exe, "-m", "PyInstaller",
         "--name", "TransferConsole",
         "--onefile",
         "--windowed",              # konsol penceresi acmaz (GUI modunda)

@@ -31,13 +31,18 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
+    # Package import mode (e.g. `from engine.transfer import run_transfer`)
     from .config import TransferJob
     from .logutil import EngineLogger, DiskInfo, get_disk_info, format_size, build_hash_log, sanitize_filename
     from .credentials import CredentialStore, resolve_unc_server
-except ImportError:  # PyInstaller / flat-module execution compatibility
+    from .scanner import scan_directory, build_rel_index
+except ImportError:
+    # Flat-module / PyInstaller compatibility mode: the frozen app executes
+    # the root-level `transfer.py` module without a package parent.
     from config import TransferJob
     from logutil import EngineLogger, DiskInfo, get_disk_info, format_size, build_hash_log, sanitize_filename
     from credentials import CredentialStore, resolve_unc_server
+    from scanner import scan_directory, build_rel_index
 
 
 @dataclass
@@ -337,21 +342,34 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 logger.error(f"Hedef olusturulamadi: {e}")
                 return result(False, "Hedef olusturulamadi")
 
-        # ---- Yas filtreli dosya listesi ----
+        # ---- Yas filtreli dosya listesi (hizli paralel tarama) ----
         logger.header("-" * 64)
-        logger.info(f"Dosya listesi aliniyor (>{job.older_than_days} gun)...")
+        logger.info(f"Dosya listesi taraniyor (>{job.older_than_days} gun)...")
         cutoff = time.time() - job.older_than_days * 86400
-        all_files: list[Path] = list(Path(job.source_path).rglob(job.file_filter))
-        all_files = [f for f in all_files if f.is_file()]
-        src_files = [f for f in all_files if f.stat().st_mtime < cutoff]
-        skipped = len(all_files) - len(src_files)
-        logger.info(f"Toplam={len(all_files)}  Tasinacak={len(src_files)}  Atlanacak(daha yeni)={skipped}")
+
+        def scan_progress(scanned: int, matched: int) -> None:
+            logger.info(f"  Taraniyor... {scanned:,} dosya kontrol edildi, {matched:,} eslesti")
+
+        scan_result = scan_directory(
+            job.source_path, file_filter=job.file_filter, mtime_cutoff=cutoff,
+            max_workers=job.robocopy_threads, progress_callback=scan_progress,
+            cancel_event=cancel_event,
+        )
+        if scan_result.cancelled:
+            logger.warn("Tarama kullanici tarafindan DURDURULDU.")
+            return result(False, "Kullanici tarafindan durduruldu")
+        if scan_result.error_count:
+            logger.warn(f"Tarama sirasinda {scan_result.error_count} dosya/dizine erisilemedi (atlandi).")
+
+        src_files = scan_result.matched
+        skipped = scan_result.skipped_count
+        logger.info(f"Tarama tamam: Tasinacak={len(src_files)}  Atlanacak(daha yeni)={skipped}")
 
         if not src_files:
             logger.success("Tasinacak dosya yok.")
             return result(True, total_files=0, skipped_files=skipped)
 
-        src_total_bytes = sum(f.stat().st_size for f in src_files)
+        src_total_bytes = sum(f.size for f in src_files)
         logger.info(f"Transfer boyutu: {format_size(src_total_bytes)}")
 
         # ---- Disk kontrolu ----
@@ -359,8 +377,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         if not proceed:
             return result(False, "Disk kontrolu basarisiz")
 
-        # ---- Kaynak hash/boyut ----
-        src_root = Path(job.source_path)
+        # ---- Kaynak hash/boyut (tarama sirasinda alinan boyut/mtime tekrar KULLANILIR, yeniden stat YOK) ----
         hash_table: dict[str, dict] = {}
 
         if job.verification_mode != "None":
@@ -370,26 +387,22 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             t0 = time.time()
 
             if job.verification_mode == "FullHash":
-                path_strs = [str(f) for f in src_files]
+                path_strs = [f.path for f in src_files]
                 hash_map = hash_files_parallel(path_strs)
                 for f in src_files:
-                    rel = str(f.relative_to(src_root))
-                    h = hash_map.get(str(f))
+                    h = hash_map.get(f.path)
                     if h:
-                        hash_table[rel.lower()] = {"hash": h, "size": f.stat().st_size, "src": str(f), "rel": rel}
+                        hash_table[f.rel_path.lower()] = {"hash": h, "size": f.size, "src": f.path, "rel": f.rel_path}
                     else:
-                        logger.warn(f"Hash alinamadi: {f}")
-            else:  # SizeOnly
+                        logger.warn(f"Hash alinamadi: {f.path}")
+            else:  # SizeOnly - boyut zaten tarama sirasinda alindi, ekstra islem gerekmez
                 for f in src_files:
-                    rel = str(f.relative_to(src_root))
-                    sz = f.stat().st_size
-                    hash_table[rel.lower()] = {"hash": f"SIZE:{sz}", "size": sz, "src": str(f), "rel": rel}
+                    hash_table[f.rel_path.lower()] = {"hash": f"SIZE:{f.size}", "size": f.size, "src": f.path, "rel": f.rel_path}
 
             logger.success(f"Kaynak analizi tamam: {len(hash_table)}/{len(src_files)}  ({time.time()-t0:.1f}sn)")
         else:
             for f in src_files:
-                rel = str(f.relative_to(src_root))
-                hash_table[rel.lower()] = {"hash": "", "size": f.stat().st_size, "src": str(f), "rel": rel}
+                hash_table[f.rel_path.lower()] = {"hash": "", "size": f.size, "src": f.path, "rel": f.rel_path}
             logger.warn("VerificationMode=None: dogrulama atlanacak.")
 
         # ---- Robocopy ----
@@ -433,16 +446,25 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             logger.header("-" * 64)
             logger.info(f"Dogrulama basliyor — mod={job.verification_mode} ({len(hash_table)} dosya)...")
             t0 = time.time()
-            dst_root = Path(job.destination_path)
+
+            # Hedefi TEK GECISTE tara (dosya basina ayri exists()/stat() cagrisi YOK).
+            # Bu, kaynak taramasindaki ayni performans duzeltmesinin hedefe uygulanmis hali.
+            logger.info("Hedef dizin taraniyor (dogrulama icin)...")
+            dst_scan = scan_directory(
+                job.destination_path, file_filter=job.file_filter, mtime_cutoff=None,
+                max_workers=job.robocopy_threads, cancel_event=cancel_event,
+            )
+            dst_index = build_rel_index(dst_scan.matched)
+            logger.info(f"Hedef tarama tamam: {len(dst_index)} dosya bulundu.")
 
             if job.verification_mode == "FullHash":
                 dst_paths = []
                 rel_map = {}
                 for rel_key, info in hash_table.items():
-                    dst_file = dst_root / info["rel"]
-                    if dst_file.exists():
-                        dst_paths.append(str(dst_file))
-                        rel_map[str(dst_file)] = rel_key
+                    dst_entry = dst_index.get(rel_key)
+                    if dst_entry is not None:
+                        dst_paths.append(dst_entry.path)
+                        rel_map[dst_entry.path] = rel_key
                     else:
                         logger.warn(f"EKSIK: {info['rel']}")
                         missing.append(info["rel"])
@@ -454,10 +476,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                     rel_key = rel_map[dst_path]
                     info = hash_table[rel_key]
                     dh = dst_hash_map.get(dst_path)
-                    try:
-                        sz = os.path.getsize(dst_path)
-                    except OSError:
-                        sz = 0
+                    sz = dst_index[rel_key].size  # taramadan geldi, ekstra stat() YOK
 
                     if dh is None:
                         logger.error(f"HASH ALINAMADI: {info['rel']}")
@@ -470,17 +489,17 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         logger.error(f"HASH UYUMSUZ: {info['rel']}  Kaynak={info['hash']}  Hedef={dh}")
                         failed.append({"rel": info["rel"], "src_hash": info["hash"], "dst_hash": dh})
                         hash_entries.append({"rel": info["rel"], "src_hash": info["hash"], "dst_hash": dh, "size": sz, "result": "MISMATCH"})
-            else:  # SizeOnly
+            else:  # SizeOnly - boyut karsilastirmasi tamamen bellek-ici, sifir ekstra I/O
                 for rel_key, info in hash_table.items():
-                    dst_file = dst_root / info["rel"]
-                    if not dst_file.exists():
+                    dst_entry = dst_index.get(rel_key)
+                    if dst_entry is None:
                         logger.warn(f"EKSIK: {info['rel']}")
                         missing.append(info["rel"])
                         hash_entries.append({"rel": info["rel"], "src_hash": f"(boyut:{format_size(info['size'])})", "dst_hash": "-", "size": 0, "result": "MISSING"})
                         continue
-                    sz = dst_file.stat().st_size
+                    sz = dst_entry.size
                     if sz == info["size"]:
-                        verified.append({"rel": info["rel"], "size": sz, "src_file": info["src"], "dst_file": str(dst_file)})
+                        verified.append({"rel": info["rel"], "size": sz, "src_file": info["src"], "dst_file": dst_entry.path})
                         hash_entries.append({"rel": info["rel"], "src_hash": f"(boyut:{format_size(info['size'])})", "dst_hash": f"(boyut:{format_size(sz)})", "size": sz, "result": "OK"})
                     else:
                         logger.error(f"BOYUT UYUMSUZ: {info['rel']}  Kaynak={format_size(info['size'])}  Hedef={format_size(sz)}")
