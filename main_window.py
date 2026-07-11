@@ -21,11 +21,11 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QTextCursor, QTextCharFormat
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QSplitter, QPlainTextEdit, QMessageBox,
-    QStatusBar, QHeaderView,
+    QStatusBar, QHeaderView, QFrame, QLabel,
 )
 
 from engine.config import JobConfigStore, TransferJob
@@ -34,6 +34,13 @@ from engine.transfer import run_transfer, TransferResult
 from engine.scheduler import register_scheduled_task, unregister_scheduled_task
 from gui.job_editor import JobEditorDialog
 from gui.cred_manager import CredentialManagerDialog
+from gui.style import (
+    LOG_LEVEL_COLORS,
+    empty_label_stylesheet,
+    log_view_stylesheet,
+    status_error_bg,
+    status_ok_bg,
+)
 
 
 COLUMNS = ["Job Adi", "Kaynak", "Hedef", "Yas(gun)", "Sil", "Aktif", "Zamanlama", "Son Calisma", "Durum"]
@@ -85,28 +92,55 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
 
-        # Arac cubugu
+        # Arac cubugu - mantiksal gruplar halinde, ayirici cizgilerle
         toolbar = QHBoxLayout()
-        self.btn_new = QPushButton("Yeni Job")
+        toolbar.setSpacing(6)
+
+        self.btn_new = QPushButton("+ Yeni Job")
+        self.btn_new.setProperty("primary", True)
         self.btn_edit = QPushButton("Duzenle")
         self.btn_delete = QPushButton("Sil")
-        self.btn_run = QPushButton("Simdi Calistir")
-        self.btn_stop = QPushButton("Durdur")
+
+        self.btn_run = QPushButton("▶ Simdi Calistir")
+        self.btn_run.setProperty("primary", True)
+        self.btn_stop = QPushButton("■ Durdur")
+        self.btn_stop.setProperty("danger", True)
         self.btn_stop.setEnabled(False)
-        self.btn_stop.setStyleSheet("background-color:#dc3c3c; color:white;")
-        self.btn_log = QPushButton("Log Goruntule")
+
+        self.btn_log = QPushButton("Log")
         self.btn_hash_log = QPushButton("Hash Log")
+
         self.btn_schedule = QPushButton("Zamanla")
         self.btn_unschedule = QPushButton("Zamanlamayi Kaldir")
+
         self.btn_cred = QPushButton("Kimlik Yoneticisi")
-        self.btn_refresh = QPushButton("Yenile")
+        self.btn_refresh = QPushButton("⟳ Yenile")
         self.btn_open_folder = QPushButton("Klasoru Ac")
 
-        for b in (self.btn_new, self.btn_edit, self.btn_delete, self.btn_run, self.btn_stop,
-                  self.btn_log, self.btn_hash_log, self.btn_schedule, self.btn_unschedule,
-                  self.btn_cred, self.btn_refresh, self.btn_open_folder):
+        def add_separator():
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.VLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            toolbar.addWidget(line)
+
+        for b in (self.btn_new, self.btn_edit, self.btn_delete):
             toolbar.addWidget(b)
+        add_separator()
+        for b in (self.btn_run, self.btn_stop):
+            toolbar.addWidget(b)
+        add_separator()
+        for b in (self.btn_log, self.btn_hash_log):
+            toolbar.addWidget(b)
+        add_separator()
+        for b in (self.btn_schedule, self.btn_unschedule):
+            toolbar.addWidget(b)
+        add_separator()
+        for b in (self.btn_cred, self.btn_refresh, self.btn_open_folder):
+            toolbar.addWidget(b)
+
         toolbar.addStretch(1)
         outer.addLayout(toolbar)
 
@@ -114,20 +148,37 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical)
         outer.addWidget(splitter, 1)
 
+        table_container = QWidget()
+        table_layout = QVBoxLayout(table_container)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(4)
+
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(26)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.doubleClicked.connect(self._on_edit)
-        splitter.addWidget(self.table)
+        table_layout.addWidget(self.table)
+
+        self.empty_label = QLabel("Henuz job yok. Baslamak icin '+ Yeni Job' butonuna tiklayin.")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setStyleSheet(empty_label_stylesheet())
+        self.empty_label.setVisible(False)
+        table_layout.addWidget(self.empty_label)
+
+        splitter.addWidget(table_container)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setStyleSheet("background-color:#121212; color:#b4ffb4; font-family:Consolas,monospace;")
+        self.log_view.setStyleSheet(log_view_stylesheet())
         self.log_view.setMaximumBlockCount(5000)  # sinirsiz buyumeyi engeller
         splitter.addWidget(self.log_view)
         splitter.setSizes([380, 300])
@@ -153,6 +204,8 @@ class MainWindow(QMainWindow):
 
     def refresh_grid(self):
         jobs = self.config_store.load()
+
+        self.table.setSortingEnabled(False)  # doldururken siralama satirlari kaydirmasin
         self.table.setRowCount(len(jobs))
         for row, job in enumerate(jobs):
             sched = f"{job.schedule_frequency} {job.schedule_time}" if job.schedule_enabled else "-"
@@ -166,12 +219,17 @@ class MainWindow(QMainWindow):
             ]
             for col, val in enumerate(values):
                 item = QTableWidgetItem(val)
+                if col in (1, 2):  # Kaynak/Hedef - uzun yollar icin tooltip
+                    item.setToolTip(val)
                 if last_status == "Basarili":
-                    item.setBackground(QColor(220, 255, 220))
+                    item.setBackground(QColor(status_ok_bg()))
                 elif last_status == "Hatali":
-                    item.setBackground(QColor(255, 220, 220))
+                    item.setBackground(QColor(status_error_bg()))
                 self.table.setItem(row, col, item)
+        self.table.setSortingEnabled(True)
 
+        self.empty_label.setVisible(len(jobs) == 0)
+        self.table.setVisible(len(jobs) > 0)
         self.status.showMessage(f"{len(jobs)} job yuklendi.")
 
     def _selected_job(self) -> Optional[TransferJob]:
@@ -224,6 +282,29 @@ class MainWindow(QMainWindow):
         self.config_store.delete_job(job.name)
         self.refresh_grid()
 
+    def _append_colored_log(self, line: str, level_override: Optional[str] = None) -> None:
+        """Log satirini seviyesine gore renklendirerek ekler. Motordan gelen
+        satirlar zaten "[SEVIYE  ]" onekini icerir (bkz. EngineLogger), bu
+        onek aranarak renk secilir. level_override verilirse (ozet mesajlari
+        icin, ornegin '=== JOB BASARILI ===') dogrudan o renk kullanilir ve
+        metne herhangi bir etiket EKLENMEZ."""
+        if level_override and level_override in LOG_LEVEL_COLORS:
+            color_hex = LOG_LEVEL_COLORS[level_override]
+        else:
+            color_hex = LOG_LEVEL_COLORS["INFO"]
+            for level, hexcolor in LOG_LEVEL_COLORS.items():
+                if f"[{level}" in line:
+                    color_hex = hexcolor
+                    break
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color_hex))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(line + "\n")
+        self.log_view.setTextCursor(cursor)
+        self.log_view.ensureCursorVisible()
+
     def _on_run(self):
         job = self._selected_job()
         if not job:
@@ -237,10 +318,10 @@ class MainWindow(QMainWindow):
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
         self.log_view.clear()
-        self.log_view.appendPlainText(f"Baslatiliyor: {job.name} [RunId: {run_id}]\n")
+        self._append_colored_log(f"Baslatiliyor: {job.name} [RunId: {run_id}]")
 
         self.worker = TransferWorker(job, self.cred_store, run_id)
-        self.worker.log_line.connect(self.log_view.appendPlainText)
+        self.worker.log_line.connect(self._append_colored_log)
         self.worker.finished_result.connect(self._on_transfer_finished)
         self.worker.start()
 
@@ -263,10 +344,10 @@ class MainWindow(QMainWindow):
 
     def _on_transfer_finished(self, result: TransferResult):
         if result.overall_success:
-            self.log_view.appendPlainText("\n=== JOB BASARILI ===")
+            self._append_colored_log("=== JOB BASARILI ===", level_override="SUCCESS")
             self.status.showMessage("Basariyla tamamlandi.")
         else:
-            self.log_view.appendPlainText(f"\n=== JOB HATALI: {result.error_message} ===")
+            self._append_colored_log(f"=== JOB HATALI: {result.error_message} ===", level_override="ERROR")
             self.status.showMessage(f"Hata: {result.error_message}")
 
         status_str = "Basarili" if result.overall_success else "Hatali"
@@ -276,7 +357,7 @@ class MainWindow(QMainWindow):
         )
 
         self.btn_run.setEnabled(True)
-        self.btn_run.setText("Simdi Calistir")
+        self.btn_run.setText("▶ Simdi Calistir")
         self.btn_stop.setEnabled(False)
         self.refresh_grid()
 

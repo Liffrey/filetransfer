@@ -200,6 +200,13 @@ class JobEditorDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
+        save_btn = buttons.button(QDialogButtonBox.StandardButton.Save)
+        if save_btn:
+            save_btn.setProperty("primary", True)
+            save_btn.setText("Kaydet")
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_btn:
+            cancel_btn.setText("Vazgec")
         buttons.accepted.connect(self._on_save)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)

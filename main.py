@@ -62,14 +62,12 @@ def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
 
 def run_gui(config_path: str, cred_dir: str) -> int:
     from PySide6.QtWidgets import QApplication
-
-    try:
-        from main_window import MainWindow
-    except ModuleNotFoundError:
-        from gui.main_window import MainWindow
+    from gui.main_window import MainWindow
+    from gui.style import build_app_stylesheet
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setStyleSheet(build_app_stylesheet())
 
     exe_path = sys.executable if not getattr(sys, "frozen", False) else sys.argv[0]
     window = MainWindow(config_path=config_path, cred_dir=cred_dir, exe_path=exe_path)
