@@ -30,19 +30,36 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Callable, Optional
 
-try:
-    # Package import mode (e.g. `from engine.transfer import run_transfer`)
-    from .config import TransferJob
-    from .logutil import EngineLogger, DiskInfo, get_disk_info, format_size, build_hash_log, sanitize_filename
-    from .credentials import CredentialStore, resolve_unc_server
-    from .scanner import scan_directory, build_rel_index
-except ImportError:
-    # Flat-module / PyInstaller compatibility mode: the frozen app executes
-    # the root-level `transfer.py` module without a package parent.
-    from config import TransferJob
-    from logutil import EngineLogger, DiskInfo, get_disk_info, format_size, build_hash_log, sanitize_filename
-    from credentials import CredentialStore, resolve_unc_server
-    from scanner import scan_directory, build_rel_index
+from engine.config import TransferJob
+from engine.logutil import EngineLogger, DiskInfo, get_disk_info, format_size, HashLogWriter, sanitize_filename
+from engine.credentials import CredentialStore, resolve_unc_server
+from engine.scanner import scan_directory, build_rel_index
+from engine.joblock import JobLock, JobLockError
+
+
+@dataclass(slots=True)
+class SourceFileInfo:
+    """hash_table degeri - eski dict-of-dict yapisina kiyasla ~%25 daha
+    az bellek kullanir (400bin+ dosyada onemli bir fark)."""
+    hash: str
+    size: int
+    src: str
+    rel: str
+
+
+@dataclass(slots=True)
+class VerifiedFileInfo:
+    rel: str
+    size: int
+    src_file: str
+    dst_file: str
+
+
+@dataclass(slots=True)
+class FailedFileInfo:
+    rel: str
+    src_hash: str
+    dst_hash: str
 
 
 @dataclass
@@ -66,8 +83,21 @@ class TransferResult:
 
 # Robocopy exit kodu bit anlami:
 #   0=degisiklik yok, 1=kopyalandi, 2=ekstra dosya, 4=uyumsuzluk,
-#   8=KOPYALAMA HATASI, 16=FATAL HATA. 8 veya 16 set ise gercek hata.
-ROBOCOPY_ERROR_MASK = 8 | 16
+#   8=KOPYALAMA HATASI (bazi dosyalar basarisiz), 16=FATAL HATA (robocopy
+#   hic calisamadi - gecersiz yol/parametre gibi).
+#
+# ONEMLI: Sadece FATAL (16) gercek bir "hic calismadi" durumudur ve
+# dogrulama asamasini ATLAMAYI gerektirir. KOPYALAMA HATASI (8) tek basina
+# robocopy'nin transferi TAMAMEN durdurdugu anlamina gelmez - kaynak
+# klasorde kopyalama sirasinda YENI bir dosya belirmesi, gecici bir
+# paylasim ihlali (sharing violation) gibi TEK TEK dosya sorunlarinda da
+# bu bit set edilir, cogu zaman dosyalarin BUYUK COGUNLUGU basariyla
+# kopyalanmis olur. Bu durumda transferi tumden basarisiz saymak yerine
+# DOGRULAMA asamasina gecilir - hangi dosyalarin EKSIK/UYUMSUZ oldugunu
+# TEK TEK ve DOGRU sekilde bu asama tespit eder (robocopy'nin kaba exit
+# kodundan cok daha faydali bir sonuc).
+ROBOCOPY_FATAL_MASK = 16
+ROBOCOPY_FILE_ERROR_BIT = 8
 
 
 def _robocopy_exit_description(code: int) -> list[str]:
@@ -259,7 +289,8 @@ ProgressCallback = Callable[[str], None]
 def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                   credential_store: Optional[CredentialStore] = None,
                   on_log: Optional[ProgressCallback] = None,
-                  cancel_event: Optional[threading.Event] = None) -> TransferResult:
+                  cancel_event: Optional[threading.Event] = None,
+                  lock_dir: Optional[str] = None) -> TransferResult:
     """
     Bir job'u calistirir: yas filtreli robocopy + hash/boyut dogrulama +
     disk kontrolu + log/hashlog/JSON-ozet uretimi.
@@ -267,6 +298,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
     on_log: her log satirinda cagrilan opsiyonel callback (GUI canli takip icin).
     cancel_event: set edildiginde robocopy calisiyorsa durdurulur, sonraki
                   asamalara (dogrulama, silme) gecilmez.
+    lock_dir: verilirse, ayni job'un ayni anda (baska bir surecten - ornegin
+              GUI'den elle "Simdi Calistir" derken Gorev Zamanlayici'nin da
+              tetiklemesi gibi) TEKRAR calistirilmasi engellenir. Verilmezse
+              kilit kontrolu YAPILMAZ (geriye donuk uyumluluk icin opsiyonel).
     """
     if run_id is None:
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -288,11 +323,13 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             on_log(f"[{level}] {message}")
         logger.log = hooked_log  # type: ignore
 
+    hash_log_created = False  # HashLogWriter GERCEKTEN tamamlanip dosyayi kapattiginda True olur
+
     def result(success: bool, error: str = "", **extra) -> TransferResult:
         return TransferResult(
             job_name=job.name, overall_success=success, error_message=error,
             log_file=str(log_file), robocopy_log=str(robocopy_log),
-            hash_log_file=str(hash_log_file) if job.verification_mode != "None" else "",
+            hash_log_file=str(hash_log_file) if hash_log_created else "",
             summary_json=str(summary_json), run_id=run_id, **extra,
         )
 
@@ -305,28 +342,35 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
     logger.info(f"Dogrulama : {job.verification_mode}  |  Robocopy /MT: {job.robocopy_threads}")
     logger.header("-" * 64)
 
-    if not job.source_path or not job.destination_path:
-        logger.error("Kaynak/Hedef tanimlanmamis!")
-        return result(False, "Yol eksik")
-
-    # ---- SMB pre-auth ----
     smb_targets: list[str] = []
-    if credential_store and job.credential_alias:
-        cred = credential_store.get(job.credential_alias)
-        if cred:
-            for p in (job.source_path, job.destination_path):
-                srv = resolve_unc_server(p)
-                if srv and srv not in smb_targets:
-                    logger.info(f"SMB pre-auth: {srv} ({cred.username})")
-                    if credential_store.register_smb_session(srv, cred):
-                        smb_targets.append(srv)
-                        logger.success(f"SMB auth OK: {srv}")
-                    else:
-                        logger.warn(f"SMB auth basarisiz: {srv} (devam edilecek)")
-        else:
-            logger.warn(f"Kimlik aliasi bulunamadi: {job.credential_alias}")
-
+    job_lock = JobLock(lock_dir, job.name) if lock_dir else None
     try:
+        if job_lock:
+            try:
+                job_lock.acquire()
+            except JobLockError as e:
+                logger.error(str(e))
+                return result(False, str(e))
+
+        if not job.source_path or not job.destination_path:
+            logger.error("Kaynak/Hedef tanimlanmamis!")
+            return result(False, "Yol eksik")
+
+        # ---- SMB pre-auth ----
+        if credential_store and job.credential_alias:
+            cred = credential_store.get(job.credential_alias)
+            if cred:
+                for p in (job.source_path, job.destination_path):
+                    srv = resolve_unc_server(p)
+                    if srv and srv not in smb_targets:
+                        logger.info(f"SMB pre-auth: {srv} ({cred.username})")
+                        if credential_store.register_smb_session(srv, cred):
+                            smb_targets.append(srv)
+                            logger.success(f"SMB auth OK: {srv}")
+                        else:
+                            logger.warn(f"SMB auth basarisiz: {srv} (devam edilecek)")
+            else:
+                logger.warn(f"Kimlik aliasi bulunamadi: {job.credential_alias}")
         # ---- Kaynak / hedef kontrolu ----
         if not os.path.exists(job.source_path):
             logger.error(f"Kaynak erisilemiyor: {job.source_path}")
@@ -345,7 +389,18 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         # ---- Yas filtreli dosya listesi (hizli paralel tarama) ----
         logger.header("-" * 64)
         logger.info(f"Dosya listesi taraniyor (>{job.older_than_days} gun)...")
-        cutoff = time.time() - job.older_than_days * 86400
+        # Gece yarisi (00:00) hizali kesim - saniye-hassas hesap YERINE.
+        # Iki sebep: (1) robocopy'nin /MINAGE:N parametresi gun-bazli
+        # calisir (resmi belgeler "N gunden yeni dosyalari haric tut" der,
+        # saat/saniye hassasiyeti belirtmez) - gece yarisi hizalamasi bizim
+        # ON-TARAMAMIZ ile robocopy'nin GERCEKTE kopyaladigi dosya kumesini
+        # daha tutarli hale getirir, boylece dogrulama asamasinda sinir
+        # farklarindan kaynaklanan sahte "EKSIK" sonuclari onlenir.
+        # (2) Ayni zamanlanmis job saat 02:00'de de 23:00'te de calissa,
+        # "30 gunden eski" ayni takvim gunune karsilik gelir - saat-bagimli
+        # tutarsizlik olmaz.
+        today_midnight = datetime.datetime.combine(datetime.date.today(), datetime.time.min)
+        cutoff = (today_midnight - datetime.timedelta(days=job.older_than_days)).timestamp()
 
         def scan_progress(scanned: int, matched: int) -> None:
             logger.info(f"  Taraniyor... {scanned:,} dosya kontrol edildi, {matched:,} eslesti")
@@ -378,7 +433,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             return result(False, "Disk kontrolu basarisiz")
 
         # ---- Kaynak hash/boyut (tarama sirasinda alinan boyut/mtime tekrar KULLANILIR, yeniden stat YOK) ----
-        hash_table: dict[str, dict] = {}
+        hash_table: dict[str, SourceFileInfo] = {}
 
         if job.verification_mode != "None":
             logger.header("-" * 64)
@@ -392,17 +447,17 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 for f in src_files:
                     h = hash_map.get(f.path)
                     if h:
-                        hash_table[f.rel_path.lower()] = {"hash": h, "size": f.size, "src": f.path, "rel": f.rel_path}
+                        hash_table[f.rel_path.lower()] = SourceFileInfo(hash=h, size=f.size, src=f.path, rel=f.rel_path)
                     else:
                         logger.warn(f"Hash alinamadi: {f.path}")
             else:  # SizeOnly - boyut zaten tarama sirasinda alindi, ekstra islem gerekmez
                 for f in src_files:
-                    hash_table[f.rel_path.lower()] = {"hash": f"SIZE:{f.size}", "size": f.size, "src": f.path, "rel": f.rel_path}
+                    hash_table[f.rel_path.lower()] = SourceFileInfo(hash=f"SIZE:{f.size}", size=f.size, src=f.path, rel=f.rel_path)
 
             logger.success(f"Kaynak analizi tamam: {len(hash_table)}/{len(src_files)}  ({time.time()-t0:.1f}sn)")
         else:
-            for f in src_files:
-                hash_table[f.rel_path.lower()] = {"hash": "", "size": f.size, "src": f.path, "rel": f.rel_path}
+            # VerificationMode=None: hash_table hicbir yerde kullanilmiyor,
+            # doldurmak sadece bellek/CPU israfi - atlaniyor.
             logger.warn("VerificationMode=None: dogrulama atlanacak.")
 
         # ---- Robocopy ----
@@ -419,22 +474,31 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             return result(False, "Kullanici tarafindan durduruldu")
 
         desc = _robocopy_exit_description(exit_code)
-        robo_ok = (exit_code & ROBOCOPY_ERROR_MASK) == 0
-        level = "ERROR" if not robo_ok else ("WARN" if exit_code > 1 else "SUCCESS")
+        robo_fatal = (exit_code & ROBOCOPY_FATAL_MASK) != 0
+        robo_had_file_errors = (exit_code & ROBOCOPY_FILE_ERROR_BIT) != 0
+        level = "ERROR" if robo_fatal else ("WARN" if exit_code > 1 else "SUCCESS")
         logger.log(f"Robocopy bitti. Exit={exit_code} ({' | '.join(desc)})  Sure={duration}", level)
 
-        if not robo_ok:
-            logger.error(f"Robocopy hata! Detay: {robocopy_log}")
+        if robo_fatal:
+            logger.error(f"Robocopy FATAL hata - transfer hic calisamadi! Detay: {robocopy_log}")
             send_alert_mail(job.smtp_server, job.mail_from, job.mail_to,
-                             f"[HATA] {job.name} - Robocopy Exit={exit_code}", f"Log: {robocopy_log}", logger)
-            return result(False, f"Robocopy hata exit={exit_code}")
-        logger.success("Robocopy basarili.")
+                             f"[HATA] {job.name} - Robocopy FATAL Exit={exit_code}", f"Log: {robocopy_log}", logger)
+            return result(False, f"Robocopy FATAL hata exit={exit_code}")
+
+        if robo_had_file_errors:
+            # Bazi dosyalarda kopyalama hatasi olustu (ornegin kaynakta transfer
+            # sirasinda yeni/degisen bir dosya, gecici paylasim ihlali gibi) ama
+            # robocopy calismaya devam etti. Transferi TUMDEN basarisiz saymak
+            # yerine dogrulama asamasina geciyoruz - hangi dosyalarin gercekten
+            # eksik/uyumsuz oldugunu ORADA tek tek ve dogru tespit edecegiz.
+            logger.warn(f"Robocopy bazi dosyalarda hata bildirdi (Exit={exit_code}). Dogrulama, etkilenen dosyalari tek tek tespit edecek. Detay: {robocopy_log}")
+        else:
+            logger.success("Robocopy basarili.")
 
         # ---- Dogrulama ----
-        verified: list[dict] = []
-        failed: list[dict] = []
+        verified: list[VerifiedFileInfo] = []
+        failed: list[FailedFileInfo] = []
         missing: list[str] = []
-        hash_entries: list[dict] = []
 
         if job.verification_mode == "None":
             total = len(src_files)
@@ -457,69 +521,72 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             dst_index = build_rel_index(dst_scan.matched)
             logger.info(f"Hedef tarama tamam: {len(dst_index)} dosya bulundu.")
 
-            if job.verification_mode == "FullHash":
-                dst_paths = []
-                rel_map = {}
-                for rel_key, info in hash_table.items():
-                    dst_entry = dst_index.get(rel_key)
-                    if dst_entry is not None:
-                        dst_paths.append(dst_entry.path)
-                        rel_map[dst_entry.path] = rel_key
-                    else:
-                        logger.warn(f"EKSIK: {info['rel']}")
-                        missing.append(info["rel"])
-                        hash_entries.append({"rel": info["rel"], "src_hash": info["hash"], "dst_hash": "-", "size": 0, "result": "MISSING"})
+            # HashLogWriter: her girdi HEMEN diske yazilir, bellekte TUM girdileri
+            # tutan bir liste (eski hash_entries) ARTIK YOK. 400bin+ dosyada bu,
+            # sadece hash log uretimi icin gereken bellegi dosya sayisindan
+            # BAGIMSIZ (sabit) hale getirir.
+            with HashLogWriter(hash_log_file, job.name, run_id, job.source_path,
+                                job.destination_path, job.verification_mode) as hlw:
+                if job.verification_mode == "FullHash":
+                    dst_paths = []
+                    rel_map = {}
+                    for rel_key, info in hash_table.items():
+                        dst_entry = dst_index.get(rel_key)
+                        if dst_entry is not None:
+                            dst_paths.append(dst_entry.path)
+                            rel_map[dst_entry.path] = rel_key
+                        else:
+                            logger.warn(f"EKSIK: {info.rel}")
+                            missing.append(info.rel)
+                            hlw.add_entry(info.rel, info.hash, "-", 0, "MISSING")
 
-                dst_hash_map = hash_files_parallel(dst_paths) if dst_paths else {}
+                    dst_hash_map = hash_files_parallel(dst_paths) if dst_paths else {}
 
-                for dst_path in dst_paths:
-                    rel_key = rel_map[dst_path]
-                    info = hash_table[rel_key]
-                    dh = dst_hash_map.get(dst_path)
-                    sz = dst_index[rel_key].size  # taramadan geldi, ekstra stat() YOK
+                    for dst_path in dst_paths:
+                        rel_key = rel_map[dst_path]
+                        info = hash_table[rel_key]
+                        dh = dst_hash_map.get(dst_path)
+                        sz = dst_index[rel_key].size  # taramadan geldi, ekstra stat() YOK
 
-                    if dh is None:
-                        logger.error(f"HASH ALINAMADI: {info['rel']}")
-                        failed.append({"rel": info["rel"], "src_hash": info["hash"], "dst_hash": "(okunamadi)"})
-                        hash_entries.append({"rel": info["rel"], "src_hash": info["hash"], "dst_hash": "(okunamadi)", "size": sz, "result": "ERROR"})
-                    elif dh == info["hash"]:
-                        verified.append({"rel": info["rel"], "size": sz, "src_file": info["src"], "dst_file": dst_path})
-                        hash_entries.append({"rel": info["rel"], "src_hash": info["hash"], "dst_hash": dh, "size": sz, "result": "OK"})
-                    else:
-                        logger.error(f"HASH UYUMSUZ: {info['rel']}  Kaynak={info['hash']}  Hedef={dh}")
-                        failed.append({"rel": info["rel"], "src_hash": info["hash"], "dst_hash": dh})
-                        hash_entries.append({"rel": info["rel"], "src_hash": info["hash"], "dst_hash": dh, "size": sz, "result": "MISMATCH"})
-            else:  # SizeOnly - boyut karsilastirmasi tamamen bellek-ici, sifir ekstra I/O
-                for rel_key, info in hash_table.items():
-                    dst_entry = dst_index.get(rel_key)
-                    if dst_entry is None:
-                        logger.warn(f"EKSIK: {info['rel']}")
-                        missing.append(info["rel"])
-                        hash_entries.append({"rel": info["rel"], "src_hash": f"(boyut:{format_size(info['size'])})", "dst_hash": "-", "size": 0, "result": "MISSING"})
-                        continue
-                    sz = dst_entry.size
-                    if sz == info["size"]:
-                        verified.append({"rel": info["rel"], "size": sz, "src_file": info["src"], "dst_file": dst_entry.path})
-                        hash_entries.append({"rel": info["rel"], "src_hash": f"(boyut:{format_size(info['size'])})", "dst_hash": f"(boyut:{format_size(sz)})", "size": sz, "result": "OK"})
-                    else:
-                        logger.error(f"BOYUT UYUMSUZ: {info['rel']}  Kaynak={format_size(info['size'])}  Hedef={format_size(sz)}")
-                        failed.append({"rel": info["rel"], "src_hash": f"SIZE:{info['size']}", "dst_hash": f"SIZE:{sz}"})
-                        hash_entries.append({"rel": info["rel"], "src_hash": f"(boyut:{format_size(info['size'])})", "dst_hash": f"(boyut:{format_size(sz)})", "size": sz, "result": "MISMATCH"})
+                        if dh is None:
+                            logger.error(f"HASH ALINAMADI: {info.rel}")
+                            failed.append(FailedFileInfo(rel=info.rel, src_hash=info.hash, dst_hash="(okunamadi)"))
+                            hlw.add_entry(info.rel, info.hash, "(okunamadi)", sz, "ERROR")
+                        elif dh == info.hash:
+                            verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_path))
+                            hlw.add_entry(info.rel, info.hash, dh, sz, "OK")
+                        else:
+                            logger.error(f"HASH UYUMSUZ: {info.rel}  Kaynak={info.hash}  Hedef={dh}")
+                            failed.append(FailedFileInfo(rel=info.rel, src_hash=info.hash, dst_hash=dh))
+                            hlw.add_entry(info.rel, info.hash, dh, sz, "MISMATCH")
+                else:  # SizeOnly - boyut karsilastirmasi tamamen bellek-ici, sifir ekstra I/O
+                    for rel_key, info in hash_table.items():
+                        dst_entry = dst_index.get(rel_key)
+                        src_hash_label = f"(boyut:{format_size(info.size)})"
+                        if dst_entry is None:
+                            logger.warn(f"EKSIK: {info.rel}")
+                            missing.append(info.rel)
+                            hlw.add_entry(info.rel, src_hash_label, "-", 0, "MISSING")
+                            continue
+                        sz = dst_entry.size
+                        if sz == info.size:
+                            verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_entry.path))
+                            hlw.add_entry(info.rel, src_hash_label, f"(boyut:{format_size(sz)})", sz, "OK")
+                        else:
+                            logger.error(f"BOYUT UYUMSUZ: {info.rel}  Kaynak={format_size(info.size)}  Hedef={format_size(sz)}")
+                            failed.append(FailedFileInfo(rel=info.rel, src_hash=f"SIZE:{info.size}", dst_hash=f"SIZE:{sz}"))
+                            hlw.add_entry(info.rel, src_hash_label, f"(boyut:{format_size(sz)})", sz, "MISMATCH")
 
-            total = len(hash_table)
-            verified_count = len(verified)
-            failed_count = len(failed)
-            missing_count = len(missing)
-            transferred_bytes = sum(v["size"] for v in verified)
-            job_ok = failed_count == 0 and missing_count == 0 and verified_count == total
-            logger.success(f"Dogrulama tamam. Sure={time.time()-t0:.1f}sn")
+                total = hlw.total_entries
+                verified_count = hlw.ok_count
+                failed_count = hlw.mismatch_count + hlw.error_count
+                missing_count = hlw.missing_count
+                transferred_bytes = hlw.total_bytes
+                job_ok = hlw.finish(str(duration))
+            hash_log_created = True  # with blogu basariyla tamamlandi, dosya gercekten diskte
 
-            hash_log_text = build_hash_log(
-                job.name, run_id, job.source_path, job.destination_path,
-                job.verification_mode, hash_entries, str(duration),
-            )
-            hash_log_file.write_text(hash_log_text, encoding="utf-8")
             logger.success(f"Hash logu yazildi: {hash_log_file}")
+            logger.success(f"Dogrulama tamam. Sure={time.time()-t0:.1f}sn")
 
         logger.header("-" * 64)
         logger.header(f"Toplam={total}  Dogrulanan={verified_count}  Basarisiz={failed_count}  Eksik={missing_count}")
@@ -546,9 +613,9 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 del_err = 0
                 for v in verified:
                     try:
-                        os.remove(v["src_file"])
+                        os.remove(v.src_file)
                     except OSError as e:
-                        logger.error(f"Silinemedi: {v['src_file']} — {e}")
+                        logger.error(f"Silinemedi: {v.src_file} — {e}")
                         del_err += 1
                 if del_err == 0:
                     logger.success("Tum kaynak dosyalar silindi.")
@@ -573,10 +640,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             },
             "log_files": {
                 "main_log": str(log_file),
-                "hash_log": str(hash_log_file) if job.verification_mode != "None" else "",
+                "hash_log": str(hash_log_file) if hash_log_created else "",
                 "robocopy_log": str(robocopy_log),
             },
-            "failed_files": failed,
+            "failed_files": [{"rel": f.rel, "src_hash": f.src_hash, "dst_hash": f.dst_hash} for f in failed],
             "missing_files": missing,
         }
         summary_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -597,3 +664,6 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             for target in smb_targets:
                 credential_store.unregister_smb_session(target)
                 logger.info(f"SMB oturumu temizlendi: {target}")
+        if job_lock:
+            job_lock.release()
+        logger.close()  # EngineLogger artik dosya tanitcisini surekli acik tutuyor - burada kapatiliyor

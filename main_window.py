@@ -52,17 +52,19 @@ class TransferWorker(QThread):
     log_line = Signal(str)
     finished_result = Signal(object)  # TransferResult
 
-    def __init__(self, job: TransferJob, cred_store: CredentialStore, run_id: str):
+    def __init__(self, job: TransferJob, cred_store: CredentialStore, run_id: str, lock_dir: str):
         super().__init__()
         self.job = job
         self.cred_store = cred_store
         self.run_id = run_id
+        self.lock_dir = lock_dir
         self.cancel_event = threading.Event()
 
     def run(self):
         result = run_transfer(
             self.job, run_id=self.run_id, credential_store=self.cred_store,
             on_log=self.log_line.emit, cancel_event=self.cancel_event,
+            lock_dir=self.lock_dir,
         )
         self.finished_result.emit(result)
 
@@ -77,6 +79,7 @@ class MainWindow(QMainWindow):
         self.cred_store = CredentialStore(cred_dir)
         self.exe_path = exe_path
         self.config_path = config_path
+        self.lock_dir = str(Path(config_path).parent / "locks")
 
         self.setWindowTitle(f"Veri Transfer Konsolu — {os.environ.get('COMPUTERNAME', 'localhost')}")
         self.resize(1100, 720)
@@ -320,7 +323,7 @@ class MainWindow(QMainWindow):
         self.log_view.clear()
         self._append_colored_log(f"Baslatiliyor: {job.name} [RunId: {run_id}]")
 
-        self.worker = TransferWorker(job, self.cred_store, run_id)
+        self.worker = TransferWorker(job, self.cred_store, run_id, self.lock_dir)
         self.worker.log_line.connect(self._append_colored_log)
         self.worker.finished_result.connect(self._on_transfer_finished)
         self.worker.start()

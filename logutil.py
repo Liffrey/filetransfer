@@ -2,6 +2,15 @@
 logutil.py
 ----------
 Log dosyasi yazimi, disk bilgisi sorgusu, dosya boyutu formatlama.
+
+BELLEK OPTIMIZASYONU (400bin+ dosya olceginde):
+- EngineLogger artik dosya tanitcisini surekli ACIK tutuyor (her log
+  satirinda ayri open/close yapmiyor) - hem hizli hem de cok sayida
+  hata/uyari olustugunda dosya tanitici acma/kapama maliyetini onler.
+- HashLogWriter, tum girdileri bellekte biriktirip TEK SEFERDE yazmak
+  yerine HER GIRDIYI HEMEN diske yazar (streaming). Eski build_hash_log()
+  fonksiyonu 400bin dosyada yuzlerce MB'lik bir liste+string olusturuyordu;
+  bu siniftaki bellek kullanimi artik dosya sayisindan BAGIMSIZ (sabit).
 """
 from __future__ import annotations
 
@@ -10,7 +19,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
 
 LEVELS = ("INFO", "WARN", "ERROR", "SUCCESS", "HEADER")
@@ -27,20 +36,24 @@ def format_size(num_bytes: float) -> str:
 
 
 class EngineLogger:
-    """Tek bir calisma (RunId) icin log dosyasina yazan basit logger."""
+    """
+    Tek bir calisma (RunId) icin log dosyasina yazan logger.
+    Dosya tanitcisi __init__'te acilir ve close()/__exit__ ile kapatilir -
+    her log() cagrisinda ayri acma/kapama YAPMAZ (eski davranistan farkli).
+    """
 
     def __init__(self, log_file: str | Path, echo: bool = False):
         self.log_file = Path(log_file)
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.echo = echo
+        self._fh: TextIO = open(self.log_file, "a", encoding="utf-8", buffering=1)  # satir-tamponlu
 
     def log(self, message: str, level: str = "INFO") -> None:
         if level not in LEVELS:
             level = "INFO"
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"{ts} [{level:<7}] {message}"
-        with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        self._fh.write(line + "\n")
         if self.echo:
             print(line)
 
@@ -49,6 +62,24 @@ class EngineLogger:
     def error(self, msg): self.log(msg, "ERROR")
     def success(self, msg): self.log(msg, "SUCCESS")
     def header(self, msg): self.log(msg, "HEADER")
+
+    def close(self) -> None:
+        if self._fh and not self._fh.closed:
+            self._fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        # Guvenlik agi: close() unutulursa bile dosya tanitici sizmasin.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -89,87 +120,116 @@ def get_disk_info(path: str) -> Optional[DiskInfo]:
         return None
 
 
-def build_hash_log(
-    job_name: str,
-    run_id: str,
-    source: str,
-    destination: str,
-    verify_mode: str,
-    entries: list[dict],
-    duration_str: str,
-) -> str:
+_BADGE_MAP = {
+    "OK": "[  OK   ]",
+    "MISMATCH": "[UYUMSUZ]",
+    "MISSING": "[ EKSIK ]",
+    "ERROR": "[ HATA  ]",
+}
+_NOTE_MAP = {
+    "OK": "Eslesti — dosya butunlugu dogrulandi",
+    "MISMATCH": "*** ESLESMEDI — kopyalama hatali veya dosya degisti ***",
+    "MISSING": "*** Hedefte bulunamadi ***",
+    "ERROR": "*** Hedef hash/boyut alinamadi ***",
+}
+_SEP1 = "=" * 160
+_SEP2 = "-" * 160
+
+
+class HashLogWriter:
     """
-    entries: her biri {rel, src_hash, dst_hash, size, result} icerir.
-    result: 'OK' | 'MISMATCH' | 'MISSING' | 'ERROR'
+    Hash/dogrulama log dosyasini AKIS HALINDE (streaming) yazar.
+
+    Eski build_hash_log() fonksiyonu TUM girdileri bir listede biriktirip
+    sonunda tek bir dev string olusturuyordu - 400bin+ dosyada bu, sadece
+    bu is icin yuzlerce MB ekstra bellek demekti. HashLogWriter, her
+    add_entry() cagrisinda ilgili satirlari DOGRUDAN diske yazar; bellekte
+    sadece birkac sayac (ok_count, mismatch_count, vb.) tutulur - bellek
+    kullanimi dosya sayisindan tamamen BAGIMSIZDIR.
+
+    Kullanim:
+        with HashLogWriter(path, job_name, run_id, source, dest, mode) as w:
+            for ... :
+                w.add_entry(rel, src_hash, dst_hash, size, result)
+        # __exit__ otomatik olarak ozet altbilgiyi yazar ve dosyayi kapatir
     """
-    sep1 = "=" * 160
-    sep2 = "-" * 160
-    lines = [
-        sep1,
-        f"  HASH / DOGRULAMA LOGU — {job_name}",
-        sep1,
-        f"  Job          : {job_name}",
-        f"  RunId        : {run_id}",
-        f"  Kaynak       : {source}",
-        f"  Hedef        : {destination}",
-        f"  Algoritma    : {'SHA256' if verify_mode == 'FullHash' else 'Boyut Karsilastirmasi'}",
-        f"  Tarih        : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        sep1,
-        "",
-    ]
 
-    badge_map = {
-        "OK": "[  OK   ]",
-        "MISMATCH": "[UYUMSUZ]",
-        "MISSING": "[ EKSIK ]",
-        "ERROR": "[ HATA  ]",
-    }
-    note_map = {
-        "OK": "Eslesti — dosya butunlugu dogrulandi",
-        "MISMATCH": "*** ESLESMEDI — kopyalama hatali veya dosya degisti ***",
-        "MISSING": "*** Hedefte bulunamadi ***",
-        "ERROR": "*** Hedef hash/boyut alinamadi ***",
-    }
+    def __init__(self, path: str | Path, job_name: str, run_id: str,
+                 source: str, destination: str, verify_mode: str):
+        self.path = Path(path)
+        self._fh = open(self.path, "w", encoding="utf-8")
+        self.ok_count = 0
+        self.mismatch_count = 0
+        self.missing_count = 0
+        self.error_count = 0
+        self.total_bytes = 0
+        self.total_entries = 0
 
-    ok_count = mismatch_count = missing_count = error_count = 0
-    total_bytes = 0
+        header = [
+            _SEP1,
+            f"  HASH / DOGRULAMA LOGU — {job_name}",
+            _SEP1,
+            f"  Job          : {job_name}",
+            f"  RunId        : {run_id}",
+            f"  Kaynak       : {source}",
+            f"  Hedef        : {destination}",
+            f"  Algoritma    : {'SHA256' if verify_mode == 'FullHash' else 'Boyut Karsilastirmasi'}",
+            f"  Tarih        : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            _SEP1,
+            "",
+        ]
+        self._fh.write("\n".join(header) + "\n")
 
-    for e in entries:
-        badge = badge_map.get(e["result"], "[ HATA  ]")
-        lines.append(f"{badge}  {e['rel']}")
-        lines.append(f"         Boyut         : {format_size(e.get('size', 0))}")
-        lines.append(f"         Kaynak Hash   : {e.get('src_hash', '-')}")
-        lines.append(f"         Hedef Hash    : {e.get('dst_hash', '-')}")
-        lines.append(f"         Karsilastirma : {note_map.get(e['result'], '-')}")
-        lines.append("")
-
-        if e["result"] == "OK":
-            ok_count += 1
-            total_bytes += e.get("size", 0)
-        elif e["result"] == "MISMATCH":
-            mismatch_count += 1
-        elif e["result"] == "MISSING":
-            missing_count += 1
+    def add_entry(self, rel: str, src_hash: str, dst_hash: str, size: int, result: str) -> None:
+        """Tek bir dosyanin dogrulama sonucunu HEMEN diske yazar (bellekte tutmaz)."""
+        badge = _BADGE_MAP.get(result, "[ HATA  ]")
+        note = _NOTE_MAP.get(result, "-")
+        self._fh.write(
+            f"{badge}  {rel}\n"
+            f"         Boyut         : {format_size(size)}\n"
+            f"         Kaynak Hash   : {src_hash}\n"
+            f"         Hedef Hash    : {dst_hash}\n"
+            f"         Karsilastirma : {note}\n\n"
+        )
+        self.total_entries += 1
+        if result == "OK":
+            self.ok_count += 1
+            self.total_bytes += size
+        elif result == "MISMATCH":
+            self.mismatch_count += 1
+        elif result == "MISSING":
+            self.missing_count += 1
         else:
-            error_count += 1
+            self.error_count += 1
 
-    overall_ok = mismatch_count == 0 and missing_count == 0 and error_count == 0
+    def finish(self, duration_str: str) -> bool:
+        """Ozet altbilgiyi yazar ve dosyayi kapatir. Genel basari durumunu doner."""
+        overall_ok = self.mismatch_count == 0 and self.missing_count == 0 and self.error_count == 0
+        footer = [
+            _SEP1,
+            "  OZET",
+            _SEP2,
+            f"  Toplam Dosya     : {self.total_entries}",
+            f"  OK  (Eslesti)    : {self.ok_count}",
+            f"  Uyumsuz          : {self.mismatch_count}",
+            f"  Eksik            : {self.missing_count}",
+            f"  Hata             : {self.error_count}",
+            f"  Transfer Boyutu  : {format_size(self.total_bytes)}",
+            f"  Sure             : {duration_str}",
+            f"  Genel Sonuc      : {'BASARILI — Tum dosyalar dogrulandi' if overall_ok else 'BASARISIZ — Hata var, yukaridaki satirlari inceleyin'}",
+            _SEP1,
+        ]
+        self._fh.write("\n".join(footer) + "\n")
+        self._fh.close()
+        return overall_ok
 
-    lines += [
-        sep1,
-        "  OZET",
-        sep2,
-        f"  Toplam Dosya     : {len(entries)}",
-        f"  OK  (Eslesti)    : {ok_count}",
-        f"  Uyumsuz          : {mismatch_count}",
-        f"  Eksik            : {missing_count}",
-        f"  Hata             : {error_count}",
-        f"  Transfer Boyutu  : {format_size(total_bytes)}",
-        f"  Sure             : {duration_str}",
-        f"  Genel Sonuc      : {'BASARILI — Tum dosyalar dogrulandi' if overall_ok else 'BASARISIZ — Hata var, yukaridaki satirlari inceleyin'}",
-        sep1,
-    ]
-    return "\n".join(lines)
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._fh.closed:
+            self._fh.close()
+        return False
 
 
 def sanitize_filename(name: str) -> str:

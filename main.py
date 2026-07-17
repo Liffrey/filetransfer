@@ -47,7 +47,7 @@ def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
         return 0
 
     result = run_transfer(job, run_id=run_id, credential_store=cred_store,
-                           on_log=lambda line: print(line))
+                           on_log=lambda line: print(line), lock_dir=str(data_dir / "locks"))
 
     status = "Basarili" if result.overall_success else "Hatali"
     message = result.error_message or f"{result.verified_files} dosya dogrulandi"

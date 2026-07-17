@@ -54,6 +54,7 @@ def main():
         "--hidden-import", "job_editor",
         "--hidden-import", "cred_manager",
         "--hidden-import", "engine",
+        "--hidden-import", "engine.joblock",
         "--hidden-import", "gui",
         str(HERE / "main.py"),
     ]
