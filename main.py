@@ -46,8 +46,18 @@ def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
         print(f"Job '{job_name}' devre disi, atlaniyor.")
         return 0
 
+    def print_progress(p) -> None:
+        # Tek satiri \r ile guncelleyerek yazar (robocopy'nin kendi ilerleme
+        # gostergesi gibi) - konsoldan elle calistirinca gorulur, Gorev
+        # Zamanlayici'nin gorulmez stdout'unda ise zararsizdir.
+        name = p.current_file or "..."
+        sys.stdout.write(f"\r  {name[:60]:<60s} %{p.percent:5.1f}")
+        sys.stdout.flush()
+
     result = run_transfer(job, run_id=run_id, credential_store=cred_store,
-                           on_log=lambda line: print(line), lock_dir=str(data_dir / "locks"))
+                           on_log=lambda line: print(line), lock_dir=str(data_dir / "locks"),
+                           on_progress=print_progress)
+    print()  # ilerleme satirindan sonra imleci yeni satira gecir
 
     status = "Basarili" if result.overall_success else "Hatali"
     message = result.error_message or f"{result.verified_files} dosya dogrulandi"
@@ -61,16 +71,27 @@ def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
 
 
 def run_gui(config_path: str, cred_dir: str) -> int:
+    from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
     from gui.main_window import MainWindow
-    from gui.style import build_app_stylesheet
+    from gui.style import THEME_LIGHT, build_app_palette, build_app_stylesheet
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    app.setStyleSheet(build_app_stylesheet())
+
+    settings = QSettings("DataTransferTool", "TransferConsole")
+    theme = str(settings.value("ui/theme", THEME_LIGHT))
+    app.setPalette(build_app_palette(theme))
+    app.setStyleSheet(build_app_stylesheet(theme))
 
     exe_path = sys.executable if not getattr(sys, "frozen", False) else sys.argv[0]
-    window = MainWindow(config_path=config_path, cred_dir=cred_dir, exe_path=exe_path)
+    window = MainWindow(
+        config_path=config_path,
+        cred_dir=cred_dir,
+        exe_path=exe_path,
+        settings=settings,
+        initial_theme=theme,
+    )
     window.show()
     return app.exec()
 

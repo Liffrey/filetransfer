@@ -20,12 +20,12 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QCoreApplication, QSettings, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QTextCursor, QTextCharFormat
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QSplitter, QPlainTextEdit, QMessageBox,
-    QStatusBar, QHeaderView, QFrame, QLabel,
+    QStatusBar, QHeaderView, QFrame, QLabel, QProgressBar,
 )
 
 from engine.config import JobConfigStore, TransferJob
@@ -36,8 +36,13 @@ from gui.job_editor import JobEditorDialog
 from gui.cred_manager import CredentialManagerDialog
 from gui.style import (
     LOG_LEVEL_COLORS,
+    THEME_DARK,
+    THEME_LIGHT,
+    build_app_palette,
+    build_app_stylesheet,
     empty_label_stylesheet,
     log_view_stylesheet,
+    progress_label_stylesheet,
     status_error_bg,
     status_ok_bg,
 )
@@ -50,6 +55,7 @@ class TransferWorker(QThread):
     """Bir job'u arka planda (ayri thread'de) calistirir."""
 
     log_line = Signal(str)
+    progress_update = Signal(str, float)  # (dosya adi, yuzde)
     finished_result = Signal(object)  # TransferResult
 
     def __init__(self, job: TransferJob, cred_store: CredentialStore, run_id: str, lock_dir: str):
@@ -60,11 +66,17 @@ class TransferWorker(QThread):
         self.lock_dir = lock_dir
         self.cancel_event = threading.Event()
 
+    def _on_progress(self, p) -> None:
+        # RobocopyProgress nesnesini Qt sinyaline uygun basit (str, float)
+        # ciftine cevirir - worker thread'den emit edilir, Qt'nin queued
+        # connection mekanizmasi GUI thread'ine guvenli sekilde tasir.
+        self.progress_update.emit(p.current_file, p.percent)
+
     def run(self):
         result = run_transfer(
             self.job, run_id=self.run_id, credential_store=self.cred_store,
             on_log=self.log_line.emit, cancel_event=self.cancel_event,
-            lock_dir=self.lock_dir,
+            lock_dir=self.lock_dir, on_progress=self._on_progress,
         )
         self.finished_result.emit(result)
 
@@ -73,13 +85,16 @@ class TransferWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, config_path: str, cred_dir: str, exe_path: str):
+    def __init__(self, config_path: str, cred_dir: str, exe_path: str,
+                 settings: Optional[QSettings] = None, initial_theme: str = THEME_LIGHT):
         super().__init__()
         self.config_store = JobConfigStore(config_path)
         self.cred_store = CredentialStore(cred_dir)
         self.exe_path = exe_path
         self.config_path = config_path
         self.lock_dir = str(Path(config_path).parent / "locks")
+        self.settings = settings or QSettings("DataTransferTool", "TransferConsole")
+        self.theme = self._normalize_theme(initial_theme)
 
         self.setWindowTitle(f"Veri Transfer Konsolu — {os.environ.get('COMPUTERNAME', 'localhost')}")
         self.resize(1100, 720)
@@ -119,6 +134,9 @@ class MainWindow(QMainWindow):
         self.btn_schedule = QPushButton("Zamanla")
         self.btn_unschedule = QPushButton("Zamanlamayi Kaldir")
 
+        self.btn_theme = QPushButton()
+        self.btn_theme.setCheckable(True)
+
         self.btn_cred = QPushButton("Kimlik Yoneticisi")
         self.btn_refresh = QPushButton("⟳ Yenile")
         self.btn_open_folder = QPushButton("Klasoru Ac")
@@ -143,6 +161,8 @@ class MainWindow(QMainWindow):
         add_separator()
         for b in (self.btn_cred, self.btn_refresh, self.btn_open_folder):
             toolbar.addWidget(b)
+
+        toolbar.addWidget(self.btn_theme)
 
         toolbar.addStretch(1)
         outer.addLayout(toolbar)
@@ -173,17 +193,34 @@ class MainWindow(QMainWindow):
 
         self.empty_label = QLabel("Henuz job yok. Baslamak icin '+ Yeni Job' butonuna tiklayin.")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_label.setStyleSheet(empty_label_stylesheet())
         self.empty_label.setVisible(False)
         table_layout.addWidget(self.empty_label)
 
         splitter.addWidget(table_container)
 
+        log_container = QWidget()
+        log_layout = QVBoxLayout(log_container)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.setSpacing(4)
+
+        progress_row = QHBoxLayout()
+        self.progress_file_label = QLabel("")
+        progress_row.addWidget(self.progress_file_label, 1)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFixedWidth(220)
+        self.progress_bar.setVisible(False)  # sadece bir job calisirken gorunur
+        progress_row.addWidget(self.progress_bar)
+        log_layout.addLayout(progress_row)
+
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setStyleSheet(log_view_stylesheet())
         self.log_view.setMaximumBlockCount(5000)  # sinirsiz buyumeyi engeller
-        splitter.addWidget(self.log_view)
+        log_layout.addWidget(self.log_view)
+
+        splitter.addWidget(log_container)
         splitter.setSizes([380, 300])
 
         self.status = QStatusBar()
@@ -202,6 +239,9 @@ class MainWindow(QMainWindow):
         self.btn_cred.clicked.connect(self._on_cred_manager)
         self.btn_refresh.clicked.connect(self.refresh_grid)
         self.btn_open_folder.clicked.connect(self._on_open_folder)
+        self.btn_theme.toggled.connect(self._on_theme_toggled)
+
+        self._apply_theme(self.theme, persist=False)
 
     # -------------------------------------------------------------- Grid
 
@@ -225,9 +265,9 @@ class MainWindow(QMainWindow):
                 if col in (1, 2):  # Kaynak/Hedef - uzun yollar icin tooltip
                     item.setToolTip(val)
                 if last_status == "Basarili":
-                    item.setBackground(QColor(status_ok_bg()))
+                    item.setBackground(QColor(status_ok_bg(self.theme)))
                 elif last_status == "Hatali":
-                    item.setBackground(QColor(status_error_bg()))
+                    item.setBackground(QColor(status_error_bg(self.theme)))
                 self.table.setItem(row, col, item)
         self.table.setSortingEnabled(True)
 
@@ -308,6 +348,41 @@ class MainWindow(QMainWindow):
         self.log_view.setTextCursor(cursor)
         self.log_view.ensureCursorVisible()
 
+    @staticmethod
+    def _normalize_theme(theme: str) -> str:
+        return THEME_DARK if str(theme).lower() == THEME_DARK else THEME_LIGHT
+
+    def _apply_theme(self, theme: str, persist: bool = True) -> None:
+        self.theme = self._normalize_theme(theme)
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.setPalette(build_app_palette(self.theme))
+            app.setStyleSheet(build_app_stylesheet(self.theme))
+
+        self.log_view.setStyleSheet(log_view_stylesheet(self.theme))
+        self.empty_label.setStyleSheet(empty_label_stylesheet(self.theme))
+        self.progress_file_label.setStyleSheet(progress_label_stylesheet(self.theme))
+
+        self.btn_theme.blockSignals(True)
+        self.btn_theme.setChecked(self.theme == THEME_DARK)
+        self.btn_theme.setText("Koyu Tema" if self.theme == THEME_LIGHT else "Açık Tema")
+        self.btn_theme.blockSignals(False)
+
+        if persist:
+            self.settings.setValue("ui/theme", self.theme)
+
+        self.refresh_grid()
+
+    def _on_theme_toggled(self, checked: bool) -> None:
+        self._apply_theme(THEME_DARK if checked else THEME_LIGHT)
+
+    def _on_progress_update(self, filename: str, percent: float) -> None:
+        self.progress_bar.setValue(int(percent))
+        if filename:
+            self.progress_file_label.setText(f"Kopyalaniyor: {filename}")
+        else:
+            self.progress_file_label.setText("")
+
     def _on_run(self):
         job = self._selected_job()
         if not job:
@@ -323,8 +398,13 @@ class MainWindow(QMainWindow):
         self.log_view.clear()
         self._append_colored_log(f"Baslatiliyor: {job.name} [RunId: {run_id}]")
 
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.progress_file_label.setText("Hazirlaniyor...")
+
         self.worker = TransferWorker(job, self.cred_store, run_id, self.lock_dir)
         self.worker.log_line.connect(self._append_colored_log)
+        self.worker.progress_update.connect(self._on_progress_update)
         self.worker.finished_result.connect(self._on_transfer_finished)
         self.worker.start()
 
@@ -346,6 +426,9 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Durdurma istegi gonderildi, bekleniyor...")
 
     def _on_transfer_finished(self, result: TransferResult):
+        self.progress_bar.setVisible(False)
+        self.progress_file_label.setText("")
+
         if result.overall_success:
             self._append_colored_log("=== JOB BASARILI ===", level_override="SUCCESS")
             self.status.showMessage("Basariyla tamamlandi.")

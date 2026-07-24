@@ -22,7 +22,6 @@ import hashlib
 import json
 import os
 import smtplib
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -35,6 +34,7 @@ from engine.logutil import EngineLogger, DiskInfo, get_disk_info, format_size, H
 from engine.credentials import CredentialStore, resolve_unc_server
 from engine.scanner import scan_directory, build_rel_index
 from engine.joblock import JobLock, JobLockError
+from engine.robocopy_runner import run_robocopy_with_progress, RobocopyProgress
 
 
 @dataclass(slots=True)
@@ -175,64 +175,6 @@ def hash_files_parallel(paths: list[str], max_workers: Optional[int] = None,
     return results
 
 
-def run_robocopy(source: str, destination: str, file_filter: str,
-                  older_than_days: int, max_retries: int, threads: int,
-                  robocopy_log: str, cancel_event: Optional["threading.Event"] = None
-                  ) -> tuple[int, "datetime.timedelta"]:
-    """
-    Robocopy'yi subprocess ile calistirir. Liste-tabanli argv kullanildigi
-    icin Windows'un kendi quoting mekanizmasi devreye girer; "E:\\" gibi
-    trailing-backslash yollarda PowerShell'de yasadigimiz kacis karakteri
-    sorunu burada olusmaz (subprocess, argv'yi doğrudan CreateProcess'e
-    Win32 API duzeyinde iletir, cmd.exe stringi ayristirma katmani devreye
-    girmez).
-
-    cancel_event verilirse, Popen+poll dongusu ile calistirilir ve event
-    set edildiginde robocopy sureci terminate edilir (GUI'deki "Durdur"
-    butonu icin). Exit code bu durumda -1 (kullanici tarafindan durduruldu)
-    olarak doner.
-    """
-    args = [
-        "robocopy",
-        source,
-        destination,
-        file_filter,
-        "/E",
-        "/COPY:DAT",
-        f"/MT:{max(1, min(128, threads))}",
-        f"/R:{max_retries}",
-        "/W:5",
-        f"/LOG+:{robocopy_log}",
-        "/NP",
-        "/BYTES",
-        "/NDL",
-    ]
-    if older_than_days > 0:
-        args.append(f"/MINAGE:{older_than_days}")
-
-    start = datetime.datetime.now()
-
-    if cancel_event is None:
-        proc = subprocess.run(args, capture_output=True, text=True)
-        duration = datetime.datetime.now() - start
-        return proc.returncode, duration
-
-    # Iptal edilebilir mod: Popen + poll dongusu
-    popen = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    while popen.poll() is None:
-        if cancel_event.is_set():
-            popen.terminate()
-            try:
-                popen.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                popen.kill()
-            duration = datetime.datetime.now() - start
-            return -1, duration
-        time.sleep(0.3)
-    duration = datetime.datetime.now() - start
-    return popen.returncode, duration
-
-
 def check_disk_and_alert(destination: str, projected_extra_bytes: int, job: TransferJob,
                           logger: EngineLogger) -> tuple[bool, Optional[DiskInfo]]:
     """
@@ -290,7 +232,8 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                   credential_store: Optional[CredentialStore] = None,
                   on_log: Optional[ProgressCallback] = None,
                   cancel_event: Optional[threading.Event] = None,
-                  lock_dir: Optional[str] = None) -> TransferResult:
+                  lock_dir: Optional[str] = None,
+                  on_progress: Optional[Callable[[RobocopyProgress], None]] = None) -> TransferResult:
     """
     Bir job'u calistirir: yas filtreli robocopy + hash/boyut dogrulama +
     disk kontrolu + log/hashlog/JSON-ozet uretimi.
@@ -302,6 +245,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
               GUI'den elle "Simdi Calistir" derken Gorev Zamanlayici'nin da
               tetiklemesi gibi) TEKRAR calistirilmasi engellenir. Verilmezse
               kilit kontrolu YAPILMAZ (geriye donuk uyumluluk icin opsiyonel).
+    on_progress: robocopy calisirken canli olarak (dosya adi, yuzde) bilgisini
+                 ileten opsiyonel callback. NOT: bu, o an kopyalanan TEK
+                 DOSYANIN yuzdesidir - robocopy'nin dogasi geregi tum job'un
+                 toplam ilerlemesini DEGIL, mevcut dosyanin ilerlemesini verir.
     """
     if run_id is None:
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -463,10 +410,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         # ---- Robocopy ----
         logger.header("-" * 64)
         logger.info(f"Robocopy basliyor (/MT:{job.robocopy_threads})...")
-        exit_code, duration = run_robocopy(
+        exit_code, duration = run_robocopy_with_progress(
             job.source_path, job.destination_path, job.file_filter,
             job.older_than_days, job.max_retries, job.robocopy_threads, str(robocopy_log),
-            cancel_event=cancel_event,
+            on_progress=on_progress, cancel_event=cancel_event,
         )
 
         if exit_code == -1:
@@ -480,12 +427,25 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         logger.log(f"Robocopy bitti. Exit={exit_code} ({' | '.join(desc)})  Sure={duration}", level)
 
         if robo_fatal:
-            logger.error(f"Robocopy FATAL hata - transfer hic calisamadi! Detay: {robocopy_log}")
+            # ONEMLI: ESKIDEN burada erken donup dogrulamayi TAMAMEN
+            # atliyorduk. Ancak /MT (coklu is parcacigi) ile calisirken,
+            # BAZI thread'ler dosyalari basariyla kopyalamisken BASKA bir
+            # thread'de ciddi bir hata olusup genel exit code'u FATAL (16)
+            # yapabiliyor - yani "hic dosya kopyalanmadi" aciklamasi
+            # coklu-thread senaryolarda HER ZAMAN dogru olmuyor. Erken
+            # donup hash log HIC uretmemek, kismen (belki cogunlukla)
+            # basarili olmus bir transferde kullaniciya HICBIR BILGI
+            # vermemek anlamina geliyordu - bu asil sikayet edilen sorundu.
+            #
+            # Simdi: FATAL durumu kaydedip/mail atip DOGRULAMAYA DEVAM
+            # ediyoruz. Dogrulama, hedefte GERCEKTE ne var ne yok tek tek
+            # tespit edip hash log uretecek. Is sonucu asla "tam basarili"
+            # RAPORLANMAZ (asagida job_ok zorla False yapiliyor), ama
+            # kullanici en azindan HANGI dosyalarin gectigini gorebilecek.
+            logger.error(f"Robocopy FATAL bildirdi (Exit={exit_code}) - dogrulama yine de yapilacak, hedefte gercekte ne oldugu tespit edilecek. Detay: {robocopy_log}")
             send_alert_mail(job.smtp_server, job.mail_from, job.mail_to,
                              f"[HATA] {job.name} - Robocopy FATAL Exit={exit_code}", f"Log: {robocopy_log}", logger)
-            return result(False, f"Robocopy FATAL hata exit={exit_code}")
-
-        if robo_had_file_errors:
+        elif robo_had_file_errors:
             # Bazi dosyalarda kopyalama hatasi olustu (ornegin kaynakta transfer
             # sirasinda yeni/degisen bir dosya, gecici paylasim ihlali gibi) ama
             # robocopy calismaya devam etti. Transferi TUMDEN basarisiz saymak
@@ -505,7 +465,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             verified_count = total
             failed_count = missing_count = 0
             transferred_bytes = src_total_bytes
-            job_ok = True
+            # FATAL bayragi varsa, dogrulama YAPILMADIGI icin (bu mod zaten
+            # dogrulama atliyor) gercekte ne kadarinin basarili oldugunu
+            # BILEMIYORUZ - guvenli tarafta kalip basarisiz raporlaniyor.
+            job_ok = not robo_fatal
         else:
             logger.header("-" * 64)
             logger.info(f"Dogrulama basliyor — mod={job.verification_mode} ({len(hash_table)} dosya)...")
@@ -582,7 +545,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 failed_count = hlw.mismatch_count + hlw.error_count
                 missing_count = hlw.missing_count
                 transferred_bytes = hlw.total_bytes
-                job_ok = hlw.finish(str(duration))
+                verification_ok = hlw.finish(str(duration))
+                # Robocopy FATAL bildirmisse, dogrulama TEK TEK her seyi
+                # gecerli bulsa bile is sonucu "tam basarili" RAPORLANMAZ -
+                # FATAL, ciddi bir sorunun isareti oldugu icin guvenli
+                # tarafta kaliniyor (kullanici log'da GERCEK detaylari gorur).
+                job_ok = verification_ok and not robo_fatal
             hash_log_created = True  # with blogu basariyla tamamlandi, dosya gercekten diskte
 
             logger.success(f"Hash logu yazildi: {hash_log_file}")
@@ -601,6 +569,13 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
 
         if job_ok:
             logger.success("TUM DOSYALAR DOGRULANDI.")
+        elif robo_fatal and failed_count == 0 and missing_count == 0:
+            # Dogrulama TEK TEK her seyi gecerli buldu (0 basarisiz, 0 eksik)
+            # ama robocopy FATAL bildirdigi icin is yine de basarisiz
+            # raporlaniyor - bunu ayri ve NET bir sekilde belirtiyoruz,
+            # yoksa "DOGRULAMA HATASI" mesaji yaniltici olurdu (dogrulamanin
+            # KENDISI aslinda sorun bulmadi).
+            logger.error(f"Robocopy FATAL bildirdigi icin is BASARISIZ sayildi, ancak dogrulanan {verified_count} dosyanin hepsi TUTARLI cikti - kismi bir basari olabilir, log'u inceleyin.")
         else:
             logger.error(f"DOGRULAMA HATASI! Basarisiz={failed_count} Eksik={missing_count}")
             send_alert_mail(job.smtp_server, job.mail_from, job.mail_to,
@@ -652,8 +627,17 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         logger.log("JOB TAMAMLANDI — BASARILI" if job_ok else "JOB TAMAMLANDI — HATALAR VAR",
                     "SUCCESS" if job_ok else "ERROR")
 
+        final_error = ""
+        if not job_ok:
+            if robo_fatal and failed_count == 0 and missing_count == 0:
+                final_error = f"Robocopy FATAL bildirdi (Exit={exit_code}), ancak dogrulanan {verified_count} dosya tutarli"
+            elif robo_fatal:
+                final_error = f"Robocopy FATAL bildirdi (Exit={exit_code}) + dogrulamada Basarisiz={failed_count} Eksik={missing_count}"
+            else:
+                final_error = f"Dogrulama: Basarisiz={failed_count} Eksik={missing_count}"
+
         return result(
-            job_ok, total_files=total, verified_files=verified_count,
+            job_ok, final_error, total_files=total, verified_files=verified_count,
             failed_files=failed_count, missing_files=missing_count,
             skipped_files=skipped, transferred_bytes=transferred_bytes,
             duration=str(duration),
