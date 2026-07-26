@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -48,7 +49,8 @@ from gui.style import (
 )
 
 
-COLUMNS = ["Job Adi", "Kaynak", "Hedef", "Yas(gun)", "Sil", "Aktif", "Zamanlama", "Son Calisma", "Durum"]
+COLUMNS = ["Job Adi", "Kaynak", "Hedef", "Yas(gun)", "Sil", "Aktif", "Zamanlama", "Son Calisma", "Durum", "Ilerleme"]
+PROGRESS_COL = COLUMNS.index("Ilerleme")
 
 
 class TransferWorker(QThread):
@@ -99,7 +101,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Veri Transfer Konsolu — {os.environ.get('COMPUTERNAME', 'localhost')}")
         self.resize(1100, 720)
 
-        self.worker: Optional[TransferWorker] = None
+        # Birden fazla FARKLI job'un GERCEKTEN paralel calisabilmesi icin tek
+        # bir self.worker yerine job adina gore bir workers sozlugu tutulur.
+        # Ayni job'un iki kez calistirilmasi burada (GUI seviyesinde) ve
+        # ayrica run_transfer icindeki JobLock ile (surecler-arasi, ornegin
+        # Gorev Zamanlayici ile cakisma icin) engellenir.
+        self.workers: dict[str, TransferWorker] = {}
+        # Her calisan job icin en son bilinen (dosya adi, yuzde) - hem tablo
+        # satirini hem de (seciliyse) alttaki ozet ilerleme cubugunu doldurmak icin.
+        self.active_progress: dict[str, tuple[str, float]] = {}
 
         self._build_ui()
         self.refresh_grid()
@@ -189,6 +199,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.doubleClicked.connect(self._on_edit)
+        self.table.itemSelectionChanged.connect(self._update_run_stop_buttons)
         table_layout.addWidget(self.table)
 
         self.empty_label = QLabel("Henuz job yok. Baslamak icin '+ Yeni Job' butonuna tiklayin.")
@@ -246,6 +257,18 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- Grid
 
     def refresh_grid(self):
+        # ONEMLI: tablo yeniden dolduruldugunda TUM QTableWidgetItem'lar
+        # sifirdan olusturulur (asagida). Siralama (sorting) acikken bu
+        # yeniden doldurma sonrasi satirlar yer degistirebilir - Qt'nin
+        # secim modeli bu durumda ESKI SATIR NUMARASINI korur, ESKI JOB'U
+        # DEGIL. Bu yuzden secili job'u ISME GORE hatirlayip yeniden
+        # doldurduktan sonra AYNI ISME GORE tekrar seciyoruz - aksi halde
+        # (ornegin bir job calistirilip "Son Calisma" sutununa gore
+        # siralama aktifken) secim sessizce BASKA BIR JOB'A kayabilir ve
+        # "Log Goruntule"/"Hash Log Goruntule" o job'un (bir onceki
+        # islemin) log dosyasini acar.
+        selected_name = self._selected_job_name()
+
         jobs = self.config_store.load()
 
         self.table.setSortingEnabled(False)  # doldururken siralama satirlari kaydirmasin
@@ -253,12 +276,24 @@ class MainWindow(QMainWindow):
         for row, job in enumerate(jobs):
             sched = f"{job.schedule_frequency} {job.schedule_time}" if job.schedule_enabled else "-"
             last_run = job.last_run[:16].replace("T", " ") if job.last_run else "-"
-            last_status = job.last_status or "-"
+
+            # Job su an bu pencereden calistiriliyorsa, Durum/Ilerleme
+            # sutunlarinda jobs.json'daki KALICI son sonuc yerine CANLI
+            # durumu gosteririz - birden fazla job ayni anda calisirken
+            # her birinin kendi satirinda gercek zamanli ilerleme gorunur.
+            running = job.name in self.workers and self.workers[job.name].isRunning()
+            if running:
+                last_status = "Calisiyor..."
+                file_name, percent = self.active_progress.get(job.name, ("", 0.0))
+                progress_text = f"%{percent:5.1f}  {file_name}".strip() if file_name else f"%{percent:5.1f}"
+            else:
+                last_status = job.last_status or "-"
+                progress_text = "-"
 
             values = [
                 job.name, job.source_path, job.destination_path,
                 str(job.older_than_days), str(job.delete_after_transfer),
-                "Evet" if job.enabled else "Hayir", sched, last_run, last_status,
+                "Evet" if job.enabled else "Hayir", sched, last_run, last_status, progress_text,
             ]
             for col, val in enumerate(values):
                 item = QTableWidgetItem(val)
@@ -273,14 +308,62 @@ class MainWindow(QMainWindow):
 
         self.empty_label.setVisible(len(jobs) == 0)
         self.table.setVisible(len(jobs) > 0)
-        self.status.showMessage(f"{len(jobs)} job yuklendi.")
+        running_count = len(self.workers)
+        suffix = f" ({running_count} job calisiyor)" if running_count else ""
+        self.status.showMessage(f"{len(jobs)} job yuklendi.{suffix}")
 
-    def _selected_job(self) -> Optional[TransferJob]:
+        if selected_name is not None:
+            self._select_job_by_name(selected_name)
+
+        self._update_run_stop_buttons()
+
+    def _selected_job_name(self) -> Optional[str]:
         row = self.table.currentRow()
         if row < 0:
             return None
-        name = self.table.item(row, 0).text()
+        item = self.table.item(row, 0)
+        return item.text() if item else None
+
+    def _select_job_by_name(self, name: str) -> None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None and item.text() == name:
+                self.table.setCurrentCell(row, 0)
+                return
+
+    def _selected_job(self) -> Optional[TransferJob]:
+        name = self._selected_job_name()
+        if name is None:
+            return None
         return self.config_store.get_job(name)
+
+    def _row_for_job_name(self, name: str) -> Optional[int]:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None and item.text() == name:
+                return row
+        return None
+
+    def _update_run_stop_buttons(self) -> None:
+        """Secili job'a gore Calistir/Durdur butonlarini ve alttaki ozet
+        ilerleme cubugunu gunceller. Birden fazla job ayni anda calisiyor
+        olabilir - bu cubuk sadece SU AN SECILI olan job'u yansitir, diger
+        calisan job'larin ilerlemesi tablodaki kendi satirlarinda gorulur."""
+        job = self._selected_job()
+        running = bool(job) and job.name in self.workers and self.workers[job.name].isRunning()
+
+        self.btn_run.setEnabled(job is not None and not running)
+        self.btn_run.setText("Calisiyor..." if running else "▶ Simdi Calistir")
+        self.btn_stop.setEnabled(running)
+
+        if running:
+            file_name, percent = self.active_progress.get(job.name, ("", 0.0))
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(int(percent))
+            self.progress_file_label.setText(f"[{job.name}] Kopyalaniyor: {file_name}" if file_name else f"[{job.name}] Hazirlaniyor...")
+        else:
+            self.progress_bar.setVisible(False)
+            self.progress_file_label.setText("")
 
     # ------------------------------------------------------------ Handlers
 
@@ -300,6 +383,14 @@ class MainWindow(QMainWindow):
         if not job:
             QMessageBox.warning(self, "Uyari", "Once bir job secin.")
             return
+        if job.name in self.workers and self.workers[job.name].isRunning():
+            # Calisan bir job'un adi degistirilirse, worker'in self.workers
+            # sozlugundeki (eski isimle kayitli) anahtari ile config'deki
+            # yeni isim uyusmaz - calisma bitince update_run_result() yeni
+            # ismi bulamaz ve sonuc SESSIZCE kaydedilmez, ilerleme de tabloda
+            # gorunmez olur. Bu yuzden calisirken duzenlemeye izin verilmez.
+            QMessageBox.warning(self, "Uyari", f"'{job.name}' su an calisiyor, once durdurun.")
+            return
         jobs = self.config_store.load()
         existing_names = [j.name for j in jobs if j.name != job.name]
         dlg = JobEditorDialog(self.cred_store, existing_job=job, existing_names=existing_names, parent=self)
@@ -314,6 +405,9 @@ class MainWindow(QMainWindow):
         job = self._selected_job()
         if not job:
             QMessageBox.warning(self, "Uyari", "Once bir job secin.")
+            return
+        if job.name in self.workers and self.workers[job.name].isRunning():
+            QMessageBox.warning(self, "Uyari", f"'{job.name}' su an calisiyor, once durdurun.")
             return
         reply = QMessageBox.question(
             self, "Onay", f"'{job.name}' silinsin mi? (Zamanlamasi da kaldirilir)",
@@ -376,65 +470,78 @@ class MainWindow(QMainWindow):
     def _on_theme_toggled(self, checked: bool) -> None:
         self._apply_theme(THEME_DARK if checked else THEME_LIGHT)
 
-    def _on_progress_update(self, filename: str, percent: float) -> None:
-        self.progress_bar.setValue(int(percent))
-        if filename:
-            self.progress_file_label.setText(f"Kopyalaniyor: {filename}")
-        else:
-            self.progress_file_label.setText("")
+    def _on_worker_log(self, job_name: str, line: str) -> None:
+        # Birden fazla job ayni anda calisirken satirlarin birbirine
+        # karismamasi icin her satirin basina hangi job'a ait oldugu eklenir.
+        self._append_colored_log(f"[{job_name}] {line}")
+
+    def _on_worker_progress(self, job_name: str, filename: str, percent: float) -> None:
+        self.active_progress[job_name] = (filename, percent)
+
+        row = self._row_for_job_name(job_name)
+        if row is not None:
+            progress_item = self.table.item(row, PROGRESS_COL)
+            if progress_item is not None:
+                text = f"%{percent:5.1f}  {filename}".strip() if filename else f"%{percent:5.1f}"
+                progress_item.setText(text)
+
+        if self._selected_job_name() == job_name:
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(int(percent))
+            self.progress_file_label.setText(f"[{job_name}] Kopyalaniyor: {filename}" if filename else f"[{job_name}] Hazirlaniyor...")
 
     def _on_run(self):
         job = self._selected_job()
         if not job:
             QMessageBox.warning(self, "Uyari", "Once bir job secin.")
             return
-        if self.worker is not None and self.worker.isRunning():
-            QMessageBox.warning(self, "Uyari", "Hali hazirda calisan bir job var.")
+        existing = self.workers.get(job.name)
+        if existing is not None and existing.isRunning():
+            QMessageBox.warning(self, "Uyari", f"'{job.name}' zaten calisiyor.")
             return
 
         import datetime
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        self.log_view.clear()
-        self._append_colored_log(f"Baslatiliyor: {job.name} [RunId: {run_id}]")
+        # NOT: log_view TUM job'lar icin PAYLASILIR (temizlenmez) - baska bir
+        # job zaten calisiyor olabilir, onun gecmis ciktisini silmemek icin.
+        self._append_colored_log(f"=== Baslatiliyor: {job.name} [RunId: {run_id}] ===")
+        self.active_progress[job.name] = ("", 0.0)
 
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        self.progress_file_label.setText("Hazirlaniyor...")
+        worker = TransferWorker(job, self.cred_store, run_id, self.lock_dir)
+        worker.log_line.connect(partial(self._on_worker_log, job.name))
+        worker.progress_update.connect(partial(self._on_worker_progress, job.name))
+        worker.finished_result.connect(partial(self._on_transfer_finished, job.name))
+        self.workers[job.name] = worker
+        worker.start()
 
-        self.worker = TransferWorker(job, self.cred_store, run_id, self.lock_dir)
-        self.worker.log_line.connect(self._append_colored_log)
-        self.worker.progress_update.connect(self._on_progress_update)
-        self.worker.finished_result.connect(self._on_transfer_finished)
-        self.worker.start()
-
-        self.btn_run.setEnabled(False)
-        self.btn_run.setText("Calisiyor...")
-        self.btn_stop.setEnabled(True)
-        self.status.showMessage(f"'{job.name}' calisiyor...")
+        self.status.showMessage(f"'{job.name}' calisiyor... ({len(self.workers)} job aktif)")
+        self.refresh_grid()
 
     def _on_stop(self):
-        if self.worker is None or not self.worker.isRunning():
+        job = self._selected_job()
+        worker = self.workers.get(job.name) if job else None
+        if worker is None or not worker.isRunning():
             return
         reply = QMessageBox.question(
             self, "Durdur",
-            "Job durdurulsun mu?\nYarim kalan dosyalar hedefte kalabilir.",
+            f"'{job.name}' durdurulsun mu?\nYarim kalan dosyalar hedefte kalabilir.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self.worker.request_stop()
-            self.status.showMessage("Durdurma istegi gonderildi, bekleniyor...")
+            worker.request_stop()
+            self.status.showMessage(f"'{job.name}' icin durdurma istegi gonderildi, bekleniyor...")
 
-    def _on_transfer_finished(self, result: TransferResult):
-        self.progress_bar.setVisible(False)
-        self.progress_file_label.setText("")
+    def _on_transfer_finished(self, job_name: str, result: TransferResult):
+        self.workers.pop(job_name, None)
+        self.active_progress.pop(job_name, None)
 
         if result.overall_success:
-            self._append_colored_log("=== JOB BASARILI ===", level_override="SUCCESS")
-            self.status.showMessage("Basariyla tamamlandi.")
+            self._append_colored_log(f"=== [{job_name}] JOB BASARILI ===", level_override="SUCCESS")
+            self.status.showMessage(f"'{job_name}' basariyla tamamlandi.")
         else:
-            self._append_colored_log(f"=== JOB HATALI: {result.error_message} ===", level_override="ERROR")
-            self.status.showMessage(f"Hata: {result.error_message}")
+            self._append_colored_log(f"=== [{job_name}] JOB HATALI: {result.error_message} ===", level_override="ERROR")
+            self.status.showMessage(f"'{job_name}' hata: {result.error_message}")
 
         status_str = "Basarili" if result.overall_success else "Hatali"
         message = result.error_message or f"{result.verified_files} dosya dogrulandi"
@@ -442,9 +549,6 @@ class MainWindow(QMainWindow):
             result.job_name, status_str, message, result.log_file, result.hash_log_file,
         )
 
-        self.btn_run.setEnabled(True)
-        self.btn_run.setText("▶ Simdi Calistir")
-        self.btn_stop.setEnabled(False)
         self.refresh_grid()
 
     def _on_view_log(self):
@@ -515,14 +619,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Klasor", folder)
 
     def closeEvent(self, event):
-        if self.worker is not None and self.worker.isRunning():
+        running = [w for w in self.workers.values() if w.isRunning()]
+        if running:
             reply = QMessageBox.question(
-                self, "Cikis", "Bir job hala calisiyor. Yine de cikilsin mi?",
+                self, "Cikis", f"{len(running)} job hala calisiyor. Yine de cikilsin mi?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self.worker.request_stop()
-            self.worker.wait(3000)
+            for worker in running:
+                worker.request_stop()
+            for worker in running:
+                worker.wait(3000)
         event.accept()

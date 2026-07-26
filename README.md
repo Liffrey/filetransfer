@@ -5,6 +5,7 @@ File Transfer Console is a PySide6-based Windows file transfer utility that prov
 ## Features
 
 - GUI and CLI execution modes
+- Run multiple transfer jobs concurrently from the GUI, each with its own live per-file progress shown in its grid row
 - Windows Task Scheduler integration
 - Robocopy-based transfer engine
 - Hash verification and log generation
@@ -76,21 +77,25 @@ TransferConsole.exe --run-job "JobName" --config "C:\ProgramData\DataTransferToo
 
 ## Project Structure
 
+The root `.py` files are the real implementation. The `engine/` and `gui/` packages
+are thin `from <module> import *` re-export shims kept only so PyInstaller can
+resolve every import path when the project is packaged - edit the root files,
+not the shims.
+
 ```text
 main.py                  Entry point (GUI + CLI)
-main_window.py           Compatibility wrapper for the flat project layout
+main_window.py           Main GUI window implementation
+job_editor.py            Add/Edit job dialog
+cred_manager.py          Credential manager dialog
 style.py                 Shared UI stylesheet and theme helpers
-gui/
-  main_window.py         Main GUI window implementation
-  job_editor.py          Add/Edit job dialog
-  cred_manager.py        Credential manager dialog
-  style.py               GUI package compatibility shim for style imports
-engine/
-  config.py              Job configuration (jobs.json) with atomic write + backup
-  transfer.py            Transfer engine with Robocopy, hashing, disk checks
-  credentials.py         Credential storage with DPAPI (Windows) + SMB pre-auth
-  scheduler.py           Windows Task Scheduler integration
-  logutil.py             Logging, disk info, hash log generation
+config.py                Job configuration (jobs.json) with atomic write + backup
+transfer.py              Transfer engine with Robocopy, hashing, disk checks
+robocopy_runner.py       Robocopy process runner with live progress parsing
+credentials.py           Credential storage with DPAPI (Windows) + SMB pre-auth
+scheduler.py             Windows Task Scheduler integration
+joblock.py               Per-job file lock to prevent duplicate concurrent runs
+logutil.py               Logging, disk info, hash log generation
+engine/, gui/            Re-export shims over the root modules (PyInstaller bundling only)
 build_exe.py             PyInstaller build script
 requirements.txt         Python dependencies
 ```
