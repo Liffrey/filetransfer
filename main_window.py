@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QCoreApplication, QSettings, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QTextCursor, QTextCharFormat
+from PySide6.QtGui import QColor, QIcon, QTextCursor, QTextCharFormat
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QSplitter, QPlainTextEdit, QMessageBox,
@@ -47,6 +47,7 @@ from gui.style import (
     status_error_bg,
     status_ok_bg,
 )
+from resources import get_app_icon_path
 
 
 COLUMNS = ["Job Adi", "Kaynak", "Hedef", "Yas(gun)", "Sil", "Aktif", "Zamanlama", "Son Calisma", "Durum", "Ilerleme"]
@@ -100,6 +101,10 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(f"Veri Transfer Konsolu — {os.environ.get('COMPUTERNAME', 'localhost')}")
         self.resize(1100, 720)
+
+        icon_path = get_app_icon_path()
+        if icon_path is not None:
+            self.setWindowIcon(QIcon(str(icon_path)))
 
         # Birden fazla FARKLI job'un GERCEKTEN paralel calisabilmesi icin tek
         # bir self.worker yerine job adina gore bir workers sozlugu tutulur.

@@ -11,8 +11,21 @@ log paneli. Artik istege bagli koyu tema da desteklenir.
 
 from PySide6.QtGui import QColor, QPalette
 
+from resources import resource_path
+
 THEME_LIGHT = "light"
 THEME_DARK = "dark"
+
+
+def _checkbox_check_icon_url() -> str:
+    """Isaretli (checked) checkbox/radio icon dosyasinin QSS url() degeri.
+
+    Windows'ta yollarin ters slash icermesi QSS parser'ini bozabiliyor;
+    forward-slash'a cevirip kullaniyoruz.
+    """
+    path = resource_path("assets", "checkbox_check.png")
+    return path.as_posix()
+
 
 ACCENT = "#3a7bd5"
 ACCENT_DARK = "#2f66b3"
@@ -93,6 +106,16 @@ def _theme_tokens(theme: str | None) -> dict[str, str]:
             "progress_text": "#c0c7d0",
             "status_ok_bg": "#285d35",
             "status_error_bg": "#6f2e2e",
+            "palette_light": "#454c58",
+            "palette_midlight": "#3a414c",
+            "palette_dark": "#14171c",
+            "palette_mid": "#20252c",
+            "palette_shadow": "#0d0f13",
+            "palette_bright_text": "#ffffff",
+            "checkbox_bg": "#2a3038",
+            "checkbox_border": "#4a5261",
+            "checkbox_disabled_bg": "#252a31",
+            "checkbox_disabled_border": "#323842",
         }
 
     return {
@@ -149,6 +172,16 @@ def _theme_tokens(theme: str | None) -> dict[str, str]:
         "progress_text": "#5a5f68",
         "status_ok_bg": STATUS_OK_BG,
         "status_error_bg": STATUS_ERROR_BG,
+        "palette_light": "#ffffff",
+        "palette_midlight": "#e8e8e8",
+        "palette_dark": "#a0a0a0",
+        "palette_mid": "#b8b8b8",
+        "palette_shadow": "#707070",
+        "palette_bright_text": "#ffffff",
+        "checkbox_bg": "#ffffff",
+        "checkbox_border": "#c9ccd1",
+        "checkbox_disabled_bg": "#eef0f2",
+        "checkbox_disabled_border": "#dde0e4",
     }
 
 
@@ -167,6 +200,12 @@ def build_app_palette(theme: str = THEME_LIGHT) -> QPalette:
     palette.setColor(QPalette.ColorRole.Highlight, QColor(ACCENT))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
     palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(tokens["field_placeholder"]))
+    palette.setColor(QPalette.ColorRole.Light, QColor(tokens["palette_light"]))
+    palette.setColor(QPalette.ColorRole.Midlight, QColor(tokens["palette_midlight"]))
+    palette.setColor(QPalette.ColorRole.Dark, QColor(tokens["palette_dark"]))
+    palette.setColor(QPalette.ColorRole.Mid, QColor(tokens["palette_mid"]))
+    palette.setColor(QPalette.ColorRole.Shadow, QColor(tokens["palette_shadow"]))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor(tokens["palette_bright_text"]))
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(tokens["button_disabled_text"]))
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(tokens["button_disabled_text"]))
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(tokens["button_disabled_text"]))
@@ -312,6 +351,33 @@ QMessageBox QLabel, QInputDialog QLabel {{
 QCheckBox, QRadioButton {{
     color: {tokens['label_text']};
     background-color: transparent;
+    spacing: 8px;
+}}
+QCheckBox::indicator, QRadioButton::indicator {{
+    width: 16px;
+    height: 16px;
+    border: 1px solid {tokens['checkbox_border']};
+    background-color: {tokens['checkbox_bg']};
+}}
+QCheckBox::indicator {{
+    border-radius: 3px;
+}}
+QRadioButton::indicator {{
+    border-radius: 8px;
+}}
+QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
+    border-color: {ACCENT};
+}}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+    border: 1px solid {ACCENT_DARK};
+    background-color: {ACCENT};
+}}
+QCheckBox::indicator:checked {{
+    image: url("{_checkbox_check_icon_url()}");
+}}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+    background-color: {tokens['checkbox_disabled_bg']};
+    border-color: {tokens['checkbox_disabled_border']};
 }}
 
 QToolTip {{

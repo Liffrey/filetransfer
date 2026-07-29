@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+APP_ICON = HERE / "assets" / "app.ico"
+CHECKBOX_ICON = HERE / "assets" / "checkbox_check.png"
 
 
 def _python_executable() -> str:
@@ -35,16 +37,23 @@ def _python_executable() -> str:
 
 def main():
     python_exe = _python_executable()
+    if not APP_ICON.exists():
+        raise FileNotFoundError(f"App icon not found: {APP_ICON}")
+    if not CHECKBOX_ICON.exists():
+        raise FileNotFoundError(f"Checkbox icon not found: {CHECKBOX_ICON}")
     args = [
         python_exe, "-m", "PyInstaller",
         "--name", "TransferConsole",
         "--onefile",
         "--windowed",              # konsol penceresi acmaz (GUI modunda)
+        "--icon", str(APP_ICON),
         "--noconfirm",
         "--clean",
         "--distpath", str(HERE / "dist"),
         "--workpath", str(HERE / "build"),
         "--specpath", str(HERE),
+        "--add-data", f"{APP_ICON};assets",
+        "--add-data", f"{CHECKBOX_ICON};assets",
         "--hidden-import", "config",
         "--hidden-import", "credentials",
         "--hidden-import", "transfer",

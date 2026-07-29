@@ -18,6 +18,8 @@ import os
 import sys
 from pathlib import Path
 
+from resources import get_app_icon_path
+
 
 def get_default_data_dir() -> Path:
     """Windows'ta %ProgramData%\\DataTransferTool, diger platformlarda ~/.datatransfertool."""
@@ -72,12 +74,17 @@ def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
 
 def run_gui(config_path: str, cred_dir: str) -> int:
     from PySide6.QtCore import QSettings
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
     from gui.main_window import MainWindow
     from gui.style import THEME_LIGHT, build_app_palette, build_app_stylesheet
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    icon_path = get_app_icon_path()
+    if icon_path is not None:
+        app.setWindowIcon(QIcon(str(icon_path)))
 
     settings = QSettings("DataTransferTool", "TransferConsole")
     theme = str(settings.value("ui/theme", THEME_LIGHT))
