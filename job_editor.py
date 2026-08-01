@@ -10,6 +10,8 @@ konumlandirmaya (Location/Point) hic gerek yoktur.
 """
 from __future__ import annotations
 
+import os
+import re
 from typing import Optional
 
 from PySide6.QtCore import Qt
@@ -245,7 +247,6 @@ class JobEditorDialog(QDialog):
 
     def _on_test_paths(self):
         src, dst = self.source_edit.text().strip(), self.dest_edit.text().strip()
-        import os
         src_ok = os.path.exists(src) if src else False
         dst_ok = os.path.exists(dst) if dst else False
         msg = f"Kaynak ({src}):\n  {'OK - erisilebilir' if src_ok else 'HATA - erisilemiyor'}\n\n"
@@ -300,9 +301,101 @@ class JobEditorDialog(QDialog):
         if not source or not dest:
             QMessageBox.warning(self, "Hata", "Kaynak ve hedef yol zorunludur.")
             return
-        if not self.is_edit and name in self.existing_names:
+        if not self.is_edit and name.lower() in {n.lower() for n in self.existing_names}:
             QMessageBox.warning(self, "Hata", f"Bu isimde bir job zaten var: {name}")
             return
+
+        # Ayni/ic-ice yollar robocopy'yi sonsuz/yikici bir kopyalama dongusune
+        # sokabilir (ozellikle Kaynagi Sil aktifken veri kaybina yol acar) -
+        # normalize edilmis yol karsilastirmasiyla erkenden engellenir.
+        norm_source = os.path.normcase(os.path.normpath(source))
+        norm_dest = os.path.normcase(os.path.normpath(dest))
+        if norm_source == norm_dest:
+            QMessageBox.warning(
+                self, "Hata",
+                "Kaynak ve hedef yol AYNI olamaz - bu, dosyalarin kendi uzerine "
+                "kopyalanmasina ve (Kaynagi Sil aktifse) veri kaybina yol acar."
+            )
+            return
+        sep = os.sep
+        # normpath, surucu KOKU (orn. "D:\") icin sondaki ayraci KORUR - kosulsuz
+        # "+ sep" eklemek bu durumda CIFT ayraca ("D:\\") yol acip startswith
+        # kontrolunu HICBIR ZAMAN eslesmeyecek sekilde bozardi (tam da kok surucu
+        # kaynak/hedef oldugunda yakalanmasi gereken tehlikeli durum).
+        norm_source_sep = norm_source if norm_source.endswith(sep) else norm_source + sep
+        norm_dest_sep = norm_dest if norm_dest.endswith(sep) else norm_dest + sep
+        if norm_dest_sep.startswith(norm_source_sep):
+            QMessageBox.warning(
+                self, "Hata",
+                "Hedef yol, kaynak yolun ICINDE olamaz - bu, robocopy'nin kopyaladigi "
+                "dosyalari tekrar tekrar kopyalamaya calismasina yol acar."
+            )
+            return
+        if norm_source_sep.startswith(norm_dest_sep):
+            QMessageBox.warning(
+                self, "Hata",
+                "Kaynak yol, hedef yolun ICINDE olamaz - bu yapilandirma guvenli degildir."
+            )
+            return
+
+        if self.warn_spin.value() >= self.crit_spin.value():
+            QMessageBox.warning(
+                self, "Hata",
+                f"Disk Uyari esigi (%{self.warn_spin.value()}), Disk Kritik esiginden "
+                f"(%{self.crit_spin.value()}) KUCUK olmalidir; aksi halde uyari hicbir "
+                "zaman tetiklenmeden dogrudan kritik duruma gecilir."
+            )
+            return
+
+        if self.sched_enabled_check.isChecked() and not re.match(
+            r"^([01]\d|2[0-3]):([0-5]\d)$", self.sched_time_edit.text().strip()
+        ):
+            QMessageBox.warning(
+                self, "Hata", "Zamanlama saati gecersiz. Format: HH:mm (ornek: 02:00, 23:45)."
+            )
+            return
+
+        smtp = self.smtp_edit.text().strip()
+        mail_from = self.mail_from_edit.text().strip()
+        mail_to = [x.strip() for x in self.mail_to_edit.text().split(",") if x.strip()]
+        if smtp or mail_from or mail_to:
+            email_re = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+            if not smtp:
+                QMessageBox.warning(self, "Hata", "Alici/Gonderen girildi ama SMTP Sunucu bos - mail hicbir zaman gonderilmez.")
+                return
+            if not mail_from:
+                QMessageBox.warning(self, "Hata", "SMTP Sunucu girildiyse Gonderen adresi de zorunludur.")
+                return
+            if not mail_to:
+                QMessageBox.warning(self, "Hata", "SMTP Sunucu girildiyse en az bir Alici adresi zorunludur.")
+                return
+            if not email_re.match(mail_from):
+                QMessageBox.warning(self, "Hata", f"Gonderen adresi gecersiz: {mail_from}")
+                return
+            invalid_to = [addr for addr in mail_to if not email_re.match(addr)]
+            if invalid_to:
+                QMessageBox.warning(self, "Hata", "Gecersiz alici adres(ler)i: " + ", ".join(invalid_to))
+                return
+
+        # Robocopy, kaynak klasorun ICERIGINI hedefe kopyalar; kaynak klasor adiyla
+        # otomatik bir alt klasor OLUSTURMAZ. Son klasor adlari uyusmuyorsa bu, dosyalarin
+        # beklenmedik sekilde hedefin KOKUNE dagilmasina yol acan yaygin bir yapilandirma
+        # hatasidir - kaydetmeden once kullaniciyi uyarip onay al.
+        src_leaf = os.path.basename(source.rstrip("\\/"))
+        dst_leaf = os.path.basename(dest.rstrip("\\/"))
+        if src_leaf and dst_leaf and src_leaf.lower() != dst_leaf.lower():
+            reply = QMessageBox.question(
+                self, "Klasor adi uyusmuyor",
+                f"Kaynak yolun son klasoru \"{src_leaf}\" iken hedef yolun son klasoru \"{dst_leaf}\".\n\n"
+                f"Robocopy kaynak klasorun ICERIGINI dogrudan hedefe kopyalar; \"{src_leaf}\" adinda "
+                "otomatik bir alt klasor OLUSTURMAZ. Eger hedefte de boyle bir alt klasor "
+                f"istiyorsaniz, Hedef Yol'un sonuna \"{src_leaf}\" eklemelisiniz.\n\n"
+                "Yine de bu sekilde kaydetmek istiyor musunuz?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         self.accept()
 

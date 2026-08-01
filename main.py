@@ -18,6 +18,17 @@ import os
 import sys
 from pathlib import Path
 
+# build_exe.py --windowed (PyInstaller GUI-subsystem) exe'lerinde konsol
+# ATANMADIGI icin sys.stdout/stderr None olur - CLI modu (--run-job, Gorev
+# Zamanlayici'nin cagirdigi yol) print()/sys.stdout.write() kullandigindan
+# ilk cikti satirinda AttributeError ile CRASH ederdi. NUL/devnull'a
+# yonlendirip GUI davranisini (konsol penceresi acilmaz) BOZMADAN CLI'in
+# calismasini garanti ediyoruz.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 from resources import get_app_icon_path
 
 

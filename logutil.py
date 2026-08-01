@@ -48,7 +48,14 @@ class EngineLogger:
         self.echo = echo
         self._fh: TextIO = open(self.log_file, "a", encoding="utf-8", buffering=1)  # satir-tamponlu
 
-    def log(self, message: str, level: str = "INFO") -> None:
+    def log(self, message: str, level: str = "INFO", console: bool = True) -> None:
+        """
+        console=False: satir DAIMA dosyaya yazilir, ancak CLI/GUI canli log
+        akisina (on_log callback - bkz. transfer.py run_transfer) YANSITILMAZ.
+        Boylece dosya-basina tekrarlanan ayrintilar (tarama ilerlemesi,
+        dosya-basina EKSIK/UYUMSUZ vb.) sadece log dosyasinda birikir, konsol/
+        GUI paneli ise genel/ozet satirlarla sinirli kalir.
+        """
         if level not in LEVELS:
             level = "INFO"
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -57,11 +64,11 @@ class EngineLogger:
         if self.echo:
             print(line)
 
-    def info(self, msg): self.log(msg, "INFO")
-    def warn(self, msg): self.log(msg, "WARN")
-    def error(self, msg): self.log(msg, "ERROR")
-    def success(self, msg): self.log(msg, "SUCCESS")
-    def header(self, msg): self.log(msg, "HEADER")
+    def info(self, msg, console: bool = True): self.log(msg, "INFO", console)
+    def warn(self, msg, console: bool = True): self.log(msg, "WARN", console)
+    def error(self, msg, console: bool = True): self.log(msg, "ERROR", console)
+    def success(self, msg, console: bool = True): self.log(msg, "SUCCESS", console)
+    def header(self, msg, console: bool = True): self.log(msg, "HEADER", console)
 
     def close(self) -> None:
         if self._fh and not self._fh.closed:

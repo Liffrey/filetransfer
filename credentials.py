@@ -29,6 +29,15 @@ from typing import Optional
 
 IS_WINDOWS = platform.system() == "Windows"
 
+# DPAPI dwFlags: varsayilan (0) sifreyi SADECE sifreleyen kullanici hesabi
+# COZEBILIR. Ancak job'lar genelde Gorev Zamanlayici uzerinden SYSTEM (veya
+# baska bir servis hesabi) olarak calisir - GUI'yi kullanan interaktif
+# kullanicidan FARKLI bir hesap. CRYPTPROTECT_LOCAL_MACHINE, sifreyi ayni
+# MAKINEDEKI herhangi bir hesabin cozebilmesini saglar; bu olmadan SYSTEM
+# olarak calisan zamanlanmis job'lar kayitli kimlik bilgilerini ASLA
+# cozemez (sessizce "Kimlik aliasi bulunamadi" hatasi verirdi).
+CRYPTPROTECT_LOCAL_MACHINE = 0x4
+
 if IS_WINDOWS:
     import ctypes.wintypes as wintypes
     _DWORD = wintypes.DWORD
@@ -71,7 +80,7 @@ def dpapi_encrypt(plaintext: bytes) -> bytes:
     out_blob = _DATA_BLOB()
 
     ok = crypt32.CryptProtectData(
-        ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)
+        ctypes.byref(in_blob), None, None, None, None, CRYPTPROTECT_LOCAL_MACHINE, ctypes.byref(out_blob)
     )
     if not ok:
         raise ctypes.WinError()
@@ -92,7 +101,7 @@ def dpapi_decrypt(ciphertext: bytes) -> bytes:
     out_blob = _DATA_BLOB()
 
     ok = crypt32.CryptUnprotectData(
-        ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)
+        ctypes.byref(in_blob), None, None, None, None, CRYPTPROTECT_LOCAL_MACHINE, ctypes.byref(out_blob)
     )
     if not ok:
         raise ctypes.WinError()

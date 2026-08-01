@@ -85,6 +85,23 @@ class ConfigError(Exception):
     pass
 
 
+def _parse_jobs(raw: list[dict]) -> list[TransferJob]:
+    jobs = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("Name")
+        if not name or not str(name).strip():
+            continue
+        # PowerShell'den kalma PascalCase anahtarlari da destekle (gecis kolayligi)
+        normalized = _normalize_keys(item)
+        try:
+            jobs.append(TransferJob.from_dict(normalized))
+        except TypeError:
+            continue
+    return jobs
+
+
 class JobConfigStore:
     """
     jobs.json dosyasini yonetir. Atomic write + .bak yedekleme + bozuk
@@ -152,10 +169,27 @@ class JobConfigStore:
         jobs.json'u okur. Ana dosya bozuk/parse-edilemez ise .bak yedeginden
         otomatik kurtarir ve ana dosyayi kurtarilan veriyle onarir.
         """
+        raw, _ = self._load_raw_safe()
+        return _parse_jobs(raw)
+
+    def _load_raw_safe(self) -> tuple[list[dict], bool]:
+        """
+        Donus: (raw_liste, okuma_guvenilir_mi).
+        Ana dosya okunamadi VE .bak'tan da kurtarilamadiysa (ornegin dosya
+        baska bir surec tarafindan kilitlenmisse) ikinci deger False olur -
+        bu durumda raw=[] GERCEKTEN "0 job" ANLAMINA GELMEZ, sadece okuma
+        basarisiz demektir. upsert_job/delete_job gibi YAZAN metodlar bu
+        farki ayirt etmeli, aksi halde bos listeyi jobs.json'un uzerine
+        yazip TUM mevcut job'lari yanlislikla SILEBILIR (load() sadece
+        goruntuleme icin kullanildiginda bu ayrimin onemi yok, o yuzden
+        genel load() API'si geriye uyumlu sekilde hala [] donuyor).
+        """
         try:
             raw = self._read_raw(self.path)
+            read_failed = False
         except ConfigError:
             raw = []
+            read_failed = True
 
         raw_text = ""
         if self.path.exists():
@@ -167,7 +201,7 @@ class JobConfigStore:
         looks_corrupted = (
             len(raw) == 0
             and self.path.exists()
-            and raw_text.strip() not in ("", "[]")
+            and (read_failed or raw_text.strip() not in ("", "[]"))
         )
 
         if looks_corrupted:
@@ -179,22 +213,19 @@ class JobConfigStore:
                     bak_data = []
                 if bak_data:
                     self._write_raw(self.path, bak_data)
-                    raw = bak_data
+                    return bak_data, True
+            if read_failed:
+                return [], False
 
-        jobs = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name") or item.get("Name")
-            if not name or not str(name).strip():
-                continue
-            # PowerShell'den kalma PascalCase anahtarlari da destekle (gecis kolayligi)
-            normalized = _normalize_keys(item)
-            try:
-                jobs.append(TransferJob.from_dict(normalized))
-            except TypeError:
-                continue
-        return jobs
+        return raw, True
+
+    def _load_jobs_checked(self) -> Optional[list[TransferJob]]:
+        """upsert_job/delete_job icin guvenli yukleme: ana dosya + yedek
+        ikisi de okunamadiysa None doner - cagiran islemi IPTAL etmelidir."""
+        raw, ok = self._load_raw_safe()
+        if not ok:
+            return None
+        return _parse_jobs(raw)
 
     def save(self, jobs: list[TransferJob], allow_empty_overwrite: bool = True) -> bool:
         """
@@ -205,7 +236,12 @@ class JobConfigStore:
         data = [j.to_dict() for j in jobs]
 
         if not data and not allow_empty_overwrite:
-            existing = self._read_raw(self.path) if self.path.exists() else []
+            try:
+                existing = self._read_raw(self.path) if self.path.exists() else []
+            except ConfigError:
+                # Mevcut dosya okunamiyor - bos veriyle uzerine yazmak
+                # riskli, guvenli tarafta kalip islemi iptal et.
+                return False
             if existing:
                 return False
 
@@ -215,7 +251,10 @@ class JobConfigStore:
             return False
 
         # Yazdiktan sonra dogrula
-        verify = self._read_raw(self.path)
+        try:
+            verify = self._read_raw(self.path)
+        except ConfigError:
+            return False
         if len(verify) != len(data):
             return False
 
@@ -234,13 +273,17 @@ class JobConfigStore:
         return None
 
     def upsert_job(self, job: TransferJob) -> bool:
-        jobs = self.load()
+        jobs = self._load_jobs_checked()
+        if jobs is None:
+            return False
         jobs = [j for j in jobs if j.name != job.name]
         jobs.append(job)
         return self.save(jobs, allow_empty_overwrite=True)
 
     def delete_job(self, name: str) -> bool:
-        jobs = self.load()
+        jobs = self._load_jobs_checked()
+        if jobs is None:
+            return False
         jobs = [j for j in jobs if j.name != name]
         return self.save(jobs, allow_empty_overwrite=True)
 

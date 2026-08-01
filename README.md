@@ -6,11 +6,13 @@ File Transfer Console is a PySide6-based Windows file transfer utility that prov
 
 - GUI and CLI execution modes
 - Run multiple transfer jobs concurrently from the GUI, each with its own live per-file progress shown in its grid row
-- Windows Task Scheduler integration
+- Windows Task Scheduler integration, including scheduling jobs that run as a non-SYSTEM account
 - Robocopy-based transfer engine
-- Hash verification and log generation
-- Credential storage with Windows DPAPI-backed persistence
-- Single-file EXE packaging with PyInstaller
+- Hash verification and log generation, with detailed step-by-step output written to the log file while the console/GUI log view stays high-level
+- Credential storage with Windows DPAPI-backed persistence, decryptable by any account on the machine (so SYSTEM-scheduled jobs can use credentials saved from the interactive GUI)
+- Job editor validation to catch dangerous configurations before saving (duplicate/blank names, identical or nested source-destination paths, inverted disk thresholds, malformed schedule times, incomplete mail settings)
+- `jobs.json` writes are resilient to transient read/IO failures - a failed read never gets misread as "zero jobs" and silently wipes existing job configuration
+- Single-file EXE packaging with PyInstaller, with CLI mode working correctly even though the EXE is built with the GUI (`--windowed`) subsystem
 - Adaptive light/dark styling based on the active system theme
 - Import compatibility for packaged and source-based execution paths
 
@@ -66,6 +68,11 @@ That directory typically contains:
 
 - `jobs.json`
 - `Credentials/`
+
+> Note: credentials are now encrypted with a machine-scoped DPAPI flag so that
+> SYSTEM-scheduled jobs can decrypt them. Credentials saved before this change
+> were encrypted per-user and must be re-entered once via the Credential
+> Manager for scheduled (non-interactive) runs to pick them up.
 
 ## Scheduled Task Usage
 

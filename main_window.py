@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from functools import partial
 from pathlib import Path
 from typing import Optional
@@ -26,7 +27,7 @@ from PySide6.QtGui import QColor, QIcon, QTextCursor, QTextCharFormat
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QSplitter, QPlainTextEdit, QMessageBox,
-    QStatusBar, QHeaderView, QFrame, QLabel, QProgressBar,
+    QStatusBar, QHeaderView, QFrame, QLabel, QProgressBar, QInputDialog, QLineEdit,
 )
 
 from engine.config import JobConfigStore, TransferJob
@@ -592,9 +593,22 @@ class MainWindow(QMainWindow):
                 self, "Bilgi", "Job'ta 'Zamanlama Aktif' isaretli degil. Once Duzenle'den aktif edin.",
             )
             return
+        run_as_password = None
+        if job.run_as_user.upper() != "SYSTEM":
+            # SYSTEM disinda bir hesapla schtasks /RP icin gercek bir parola
+            # sart - yoksa schtasks etkilesimli parola istemine kilitlenir.
+            password, ok = QInputDialog.getText(
+                self, "Hesap Parolasi",
+                f"'{job.run_as_user}' hesabinin parolasini girin:",
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok or not password:
+                QMessageBox.warning(self, "Iptal", "Parola girilmeden gorev olusturulamaz.")
+                return
+            run_as_password = password
         res = register_scheduled_task(
             job.name, self.exe_path, job.schedule_frequency, job.schedule_time,
-            job.schedule_weekly_day, job.run_as_user, self.config_path,
+            job.schedule_weekly_day, job.run_as_user, self.config_path, run_as_password,
         )
         if res.success:
             QMessageBox.information(self, "Basarili", res.message)
@@ -635,6 +649,23 @@ class MainWindow(QMainWindow):
                 return
             for worker in running:
                 worker.request_stop()
-            for worker in running:
-                worker.wait(3000)
+            # Qt, hala CALISAN bir QThread yok edilirse ("QThread: Destroyed
+            # while thread is still running") CRASH/tanimsiz davranisa yol
+            # acar - sabit kisa bir bekleme sonrasi kosulsuz kapatmak yerine
+            # thread'ler GERCEKTEN bitene kadar (UI donmasin diye
+            # processEvents ile) beklenir; makul surede bitmezlerse kapanis
+            # IPTAL edilir (veri bozulmasi/crash riskini almaktansa).
+            still_running = list(running)
+            deadline = time.monotonic() + 30
+            while still_running and time.monotonic() < deadline:
+                still_running = [w for w in still_running if not w.wait(200)]
+                QCoreApplication.processEvents()
+            if still_running:
+                QMessageBox.warning(
+                    self, "Bekleniyor",
+                    f"{len(still_running)} job durduruluyor, henuz tamamlanmadi. "
+                    "Birkac saniye sonra tekrar kapatmayi deneyin.",
+                )
+                event.ignore()
+                return
         event.accept()

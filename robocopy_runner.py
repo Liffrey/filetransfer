@@ -29,6 +29,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -55,8 +56,8 @@ class RobocopyProgress:
 ProgressCallback = Callable[[RobocopyProgress], None]
 
 
-def _reader_thread(pipe, line_queue: "list", stop_flag: list) -> None:
-    """Popen.stdout'tan satir satir okuyup paylasilan listeye ekler.
+def _reader_thread(pipe, line_queue: "deque[str]", stop_flag: list) -> None:
+    """Popen.stdout'tan satir satir okuyup paylasilan kuyruga ekler.
     Ayri thread'de calisir ki ana dongu readline()'da bloke olmadan
     cancel_event'i sik sik kontrol edebilsin."""
     try:
@@ -115,7 +116,10 @@ def run_robocopy_with_progress(
         text=True, bufsize=1, universal_newlines=True,
     )
 
-    line_queue: list = []
+    # deque.popleft() O(1)'dir; duz list.pop(0) her cagirista kalan tum
+    # elemanlari kaydirdigi icin robocopy binlerce/yuz binlerce dosya satiri
+    # urettiginde O(n^2) toplam maliyete (ciddi yavaslama) yol aciyordu.
+    line_queue: deque = deque()
     stop_flag = [False]
     reader = threading.Thread(target=_reader_thread, args=(proc.stdout, line_queue, stop_flag), daemon=True)
     reader.start()
@@ -143,7 +147,7 @@ def run_robocopy_with_progress(
                 time.sleep(0.05)
                 continue
 
-            line = line_queue.pop(0).rstrip("\n").rstrip("\r")
+            line = line_queue.popleft().rstrip("\n").rstrip("\r")
             if not line.strip():
                 continue
 

@@ -265,9 +265,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
     logger = EngineLogger(log_file)
     if on_log:
         original_log = logger.log
-        def hooked_log(message, level="INFO"):
-            original_log(message, level)
-            on_log(f"[{level}] {message}")
+        def hooked_log(message, level="INFO", console=True):
+            original_log(message, level, console)
+            # console=False olan satirlar (dosya-basina ayrintilar) sadece
+            # log dosyasina yazilir, CLI/GUI canli akisina YANSITILMAZ.
+            if console:
+                on_log(f"[{level}] {message}")
         logger.log = hooked_log  # type: ignore
 
     hash_log_created = False  # HashLogWriter GERCEKTEN tamamlanip dosyayi kapattiginda True olur
@@ -350,7 +353,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         cutoff = (today_midnight - datetime.timedelta(days=job.older_than_days)).timestamp()
 
         def scan_progress(scanned: int, matched: int) -> None:
-            logger.info(f"  Taraniyor... {scanned:,} dosya kontrol edildi, {matched:,} eslesti")
+            logger.info(f"  Taraniyor... {scanned:,} dosya kontrol edildi, {matched:,} eslesti", console=False)
 
         scan_result = scan_directory(
             job.source_path, file_filter=job.file_filter, mtime_cutoff=cutoff,
@@ -396,7 +399,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                     if h:
                         hash_table[f.rel_path.lower()] = SourceFileInfo(hash=h, size=f.size, src=f.path, rel=f.rel_path)
                     else:
-                        logger.warn(f"Hash alinamadi: {f.path}")
+                        logger.warn(f"Hash alinamadi: {f.path}", console=False)
             else:  # SizeOnly - boyut zaten tarama sirasinda alindi, ekstra islem gerekmez
                 for f in src_files:
                     hash_table[f.rel_path.lower()] = SourceFileInfo(hash=f"SIZE:{f.size}", size=f.size, src=f.path, rel=f.rel_path)
@@ -499,7 +502,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                             dst_paths.append(dst_entry.path)
                             rel_map[dst_entry.path] = rel_key
                         else:
-                            logger.warn(f"EKSIK: {info.rel}")
+                            logger.warn(f"EKSIK: {info.rel}", console=False)
                             missing.append(info.rel)
                             hlw.add_entry(info.rel, info.hash, "-", 0, "MISSING")
 
@@ -512,14 +515,14 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         sz = dst_index[rel_key].size  # taramadan geldi, ekstra stat() YOK
 
                         if dh is None:
-                            logger.error(f"HASH ALINAMADI: {info.rel}")
+                            logger.error(f"HASH ALINAMADI: {info.rel}", console=False)
                             failed.append(FailedFileInfo(rel=info.rel, src_hash=info.hash, dst_hash="(okunamadi)"))
                             hlw.add_entry(info.rel, info.hash, "(okunamadi)", sz, "ERROR")
                         elif dh == info.hash:
                             verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_path))
                             hlw.add_entry(info.rel, info.hash, dh, sz, "OK")
                         else:
-                            logger.error(f"HASH UYUMSUZ: {info.rel}  Kaynak={info.hash}  Hedef={dh}")
+                            logger.error(f"HASH UYUMSUZ: {info.rel}  Kaynak={info.hash}  Hedef={dh}", console=False)
                             failed.append(FailedFileInfo(rel=info.rel, src_hash=info.hash, dst_hash=dh))
                             hlw.add_entry(info.rel, info.hash, dh, sz, "MISMATCH")
                 else:  # SizeOnly - boyut karsilastirmasi tamamen bellek-ici, sifir ekstra I/O
@@ -527,7 +530,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         dst_entry = dst_index.get(rel_key)
                         src_hash_label = f"(boyut:{format_size(info.size)})"
                         if dst_entry is None:
-                            logger.warn(f"EKSIK: {info.rel}")
+                            logger.warn(f"EKSIK: {info.rel}", console=False)
                             missing.append(info.rel)
                             hlw.add_entry(info.rel, src_hash_label, "-", 0, "MISSING")
                             continue
@@ -536,7 +539,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                             verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_entry.path))
                             hlw.add_entry(info.rel, src_hash_label, f"(boyut:{format_size(sz)})", sz, "OK")
                         else:
-                            logger.error(f"BOYUT UYUMSUZ: {info.rel}  Kaynak={format_size(info.size)}  Hedef={format_size(sz)}")
+                            logger.error(f"BOYUT UYUMSUZ: {info.rel}  Kaynak={format_size(info.size)}  Hedef={format_size(sz)}", console=False)
                             failed.append(FailedFileInfo(rel=info.rel, src_hash=f"SIZE:{info.size}", dst_hash=f"SIZE:{sz}"))
                             hlw.add_entry(info.rel, src_hash_label, f"(boyut:{format_size(sz)})", sz, "MISMATCH")
 
@@ -590,7 +593,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                     try:
                         os.remove(v.src_file)
                     except OSError as e:
-                        logger.error(f"Silinemedi: {v.src_file} — {e}")
+                        logger.error(f"Silinemedi: {v.src_file} — {e}", console=False)
                         del_err += 1
                 if del_err == 0:
                     logger.success("Tum kaynak dosyalar silindi.")
@@ -647,7 +650,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         if credential_store:
             for target in smb_targets:
                 credential_store.unregister_smb_session(target)
-                logger.info(f"SMB oturumu temizlendi: {target}")
+                logger.info(f"SMB oturumu temizlendi: {target}", console=False)
         if job_lock:
             job_lock.release()
         logger.close()  # EngineLogger artik dosya tanitcisini surekli acik tutuyor - burada kapatiliyor
