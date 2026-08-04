@@ -22,8 +22,10 @@ from style import (  # noqa: F401
     empty_label_stylesheet,
     log_view_stylesheet,
     progress_label_stylesheet,
+    status_cancelled_bg,
     status_error_bg,
     status_ok_bg,
+    status_running_bg,
 )
 
 
@@ -44,6 +46,8 @@ __all__ = [
     "empty_label_stylesheet",
     "log_view_stylesheet",
     "progress_label_stylesheet",
+    "status_cancelled_bg",
     "status_error_bg",
     "status_ok_bg",
+    "status_running_bg",
 ]

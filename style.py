@@ -106,6 +106,8 @@ def _theme_tokens(theme: str | None) -> dict[str, str]:
             "progress_text": "#c0c7d0",
             "status_ok_bg": "#285d35",
             "status_error_bg": "#6f2e2e",
+            "status_running_bg": "#2c4a68",
+            "status_cancelled_bg": "#5c4a1f",
             "palette_light": "#454c58",
             "palette_midlight": "#3a414c",
             "palette_dark": "#14171c",
@@ -172,6 +174,8 @@ def _theme_tokens(theme: str | None) -> dict[str, str]:
         "progress_text": "#5a5f68",
         "status_ok_bg": STATUS_OK_BG,
         "status_error_bg": STATUS_ERROR_BG,
+        "status_running_bg": "#dbe9fb",
+        "status_cancelled_bg": "#fff2cf",
         "palette_light": "#ffffff",
         "palette_midlight": "#e8e8e8",
         "palette_dark": "#a0a0a0",
@@ -414,6 +418,14 @@ def status_ok_bg(theme: str = THEME_LIGHT) -> str:
 
 def status_error_bg(theme: str = THEME_LIGHT) -> str:
     return _theme_tokens(theme)["status_error_bg"]
+
+
+def status_running_bg(theme: str = THEME_LIGHT) -> str:
+    return _theme_tokens(theme)["status_running_bg"]
+
+
+def status_cancelled_bg(theme: str = THEME_LIGHT) -> str:
+    return _theme_tokens(theme)["status_cancelled_bg"]
 
 
 APP_STYLESHEET = build_app_stylesheet(THEME_LIGHT)

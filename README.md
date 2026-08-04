@@ -5,10 +5,12 @@ File Transfer Console is a PySide6-based Windows file transfer utility that prov
 ## Features
 
 - GUI and CLI execution modes
-- Run multiple transfer jobs concurrently from the GUI, each with its own live per-file progress shown in its grid row
+- Run multiple transfer jobs concurrently from the GUI, tracked in a live "Gorevler" (Tasks) panel showing each job's stage, progress and duration, plus per-row Log/Hash Log buttons in the main grid and a separate live log view per job
 - Windows Task Scheduler integration, including scheduling jobs that run as a non-SYSTEM account
 - Robocopy-based transfer engine
-- Hash verification and log generation, with detailed step-by-step output written to the log file while the console/GUI log view stays high-level
+- Hash (SHA256) or size-only verification with detailed step-by-step output written to the log file while the console/GUI log view stays high-level
+- Partial-failure-safe: if a handful of files fail verification out of a large batch, only those files are retried (re-copied and re-verified) - a run is never all-or-nothing, and source deletion proceeds for every file that is actually verified good, even if a few files remain permanently failed (those are kept in the source and reported separately)
+- Parallel hashing and source deletion (thread pool, sized from the job's own thread setting) instead of one-file-at-a-time loops, so verifying/deleting hundreds of thousands of files over a network share takes minutes instead of hours
 - Credential storage with Windows DPAPI-backed persistence, decryptable by any account on the machine (so SYSTEM-scheduled jobs can use credentials saved from the interactive GUI)
 - Job editor validation to catch dangerous configurations before saving (duplicate/blank names, identical or nested source-destination paths, inverted disk thresholds, malformed schedule times, incomplete mail settings)
 - `jobs.json` writes are resilient to transient read/IO failures - a failed read never gets misread as "zero jobs" and silently wipes existing job configuration

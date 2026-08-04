@@ -50,7 +50,10 @@ _FILE_LINE_RE = re.compile(
 @dataclass
 class RobocopyProgress:
     current_file: str = ""
-    percent: float = 0.0
+    percent: float = 0.0  # o an kopyalanan TEK dosyanin yuzdesi (job'un tamami DEGIL)
+    files_done: int = 0
+    files_total: int = 0
+    percent_overall: float = 0.0  # files_done/files_total - TUM job'un gercek ilerlemesi
 
 
 ProgressCallback = Callable[[RobocopyProgress], None]
@@ -81,12 +84,20 @@ def run_robocopy_with_progress(
     robocopy_log: str,
     on_progress: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
+    total_files: int = 0,
 ) -> tuple[int, "__import__('datetime').timedelta"]:
     """
     Robocopy'yi calistirir, ilerleme yuzdesini CANLI olarak on_progress'e
     bildirir, ANLAMLI satirlari (yuzde spam'i HARIC) robocopy_log dosyasina
     yazar. Donus degeri run_robocopy ile AYNI (exit_code, duration) - mevcut
     cagiran kod (transfer.py) minimal degisiklikle gecis yapabilir.
+
+    total_files: cagiranin (transfer.py) kendi on-taramasindan bildigi toplam
+                 dosya sayisi - job'un GERCEK toplam ilerlemesini (files_done/
+                 total_files) hesaplamak icin kullanilir. Robocopy zaten
+                 GUNCEL/ayni dosyalar icin hicbir satir BASMADIGINDAN
+                 (sadece New/Newer/Changed/Tweaked/*EXTRA icin satir basar),
+                 bu bir YAKLASIMDIR - kesin degildir.
     """
     import datetime
 
@@ -126,6 +137,20 @@ def run_robocopy_with_progress(
 
     current_file = ""
     was_cancelled = False
+    files_seen = 0  # su ana kadar goruntlenen "yeni dosya" satiri sayisi
+
+    def emit_progress(percent: float) -> None:
+        if on_progress is None:
+            return
+        files_done = max(0, files_seen - 1)
+        percent_overall = round(files_done / total_files * 100, 1) if total_files else 0.0
+        try:
+            on_progress(RobocopyProgress(
+                current_file=current_file, percent=percent,
+                files_done=files_done, files_total=total_files, percent_overall=percent_overall,
+            ))
+        except Exception:
+            pass
 
     try:
         while True:
@@ -155,16 +180,15 @@ def run_robocopy_with_progress(
             if pct_match:
                 # Yuzde satiri: SADECE ilerleme bildirimi icin kullanilir,
                 # log dosyasina YAZILMAZ (spam onleme).
-                if on_progress:
-                    try:
-                        on_progress(RobocopyProgress(current_file=current_file, percent=float(pct_match.group(1))))
-                    except Exception:
-                        pass
+                emit_progress(float(pct_match.group(1)))
                 continue
 
             file_match = _FILE_LINE_RE.match(line)
             if file_match:
+                # Yeni bir dosya satiri = BIR ONCEKI dosya tamamlandi demektir.
+                files_seen += 1
                 current_file = file_match.group(1).strip()
+                emit_progress(0.0)
 
             # Yuzde-disi TUM satirlar (basliklar, dosya adlari, hatalar,
             # ozet) kendi yonettigimiz log dosyasina yazilir.
@@ -182,5 +206,10 @@ def run_robocopy_with_progress(
 
     if was_cancelled:
         return -1, duration
+
+    # Surec bitti - son dosya da tamamlanmis sayilir (basarili/hatali farketmez,
+    # robocopy bir sonraki dosyaya GECMISTIR artik).
+    files_seen += 1
+    emit_progress(100.0)
 
     return proc.returncode, duration
