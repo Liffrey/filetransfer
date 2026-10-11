@@ -46,6 +46,15 @@ _FILE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Robocopy hata satiri: "<tarih> <saat> ERROR <kod> (0xNNNNNNNN) <islem+yol>"
+# Ornek: "2024/06/10 10:15:23 ERROR 32 (0x00000020) Copying File D:\src\a.txt"
+_ERROR_LINE_RE = re.compile(
+    r'^\s*\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+ERROR\s+\d+\s+\(0x[0-9A-Fa-f]+\)\s+(.+?)\s*$',
+    re.IGNORECASE,
+)
+# Robocopy'nin /W bekleme satiri - bir sonraki tekrar denemeden ONCE basilir.
+_WAITING_LINE_RE = re.compile(r'Waiting\s+(\d+)\s+seconds', re.IGNORECASE)
+
 
 @dataclass
 class RobocopyProgress:
@@ -85,6 +94,7 @@ def run_robocopy_with_progress(
     on_progress: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     total_files: int = 0,
+    on_log: Optional[Callable[[str], None]] = None,
 ) -> tuple[int, "__import__('datetime').timedelta"]:
     """
     Robocopy'yi calistirir, ilerleme yuzdesini CANLI olarak on_progress'e
@@ -98,6 +108,13 @@ def run_robocopy_with_progress(
                  GUNCEL/ayni dosyalar icin hicbir satir BASMADIGINDAN
                  (sadece New/Newer/Changed/Tweaked/*EXTRA icin satir basar),
                  bu bir YAKLASIMDIR - kesin degildir.
+
+    on_log: robocopy KENDI ICINDE (/R:{max_retries} /W:5 ile) bir dosyayi
+            tekrar denerken (ornegin dosya baska bir islem tarafindan
+            kullanimdaysa) bunu CANLI bildiren opsiyonel callback. Bu
+            olmadan, robocopy dosya kilitliyken sessizce N kez bekleyip
+            tekrar deniyor ve kullanici bu sirada arka planda ne oldugunu
+            goremiyordu (sadece ham robocopy_log dosyasinda gorunuyordu).
     """
     import datetime
 
@@ -117,6 +134,7 @@ def run_robocopy_with_progress(
     ]
     if older_than_days > 0:
         args.append(f"/MINAGE:{older_than_days}")
+
 
     Path(robocopy_log).parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(robocopy_log, "w", encoding="utf-8", errors="replace")
@@ -138,6 +156,31 @@ def run_robocopy_with_progress(
     current_file = ""
     was_cancelled = False
     files_seen = 0  # su ana kadar goruntlenen "yeni dosya" satiri sayisi
+
+    # Robocopy'nin KENDI /R+/W tekrar-deneme mekanizmasini canli takip etmek
+    # icin: bir ERROR satiri gorulunce hangi islem/dosyanin basarisiz oldugu
+    # (pending_error_detail) ve varsa aciklama satiri (pending_error_reason)
+    # bir sonraki "Waiting N seconds" satirina kadar biriktirilir - o satir
+    # geldiginde robocopy'nin GERCEKTEN tekrar denemeye gectigi anlasilir.
+    pending_error_detail: Optional[str] = None
+    pending_error_reason: str = ""
+    retry_counts: dict[str, int] = {}
+    max_attempts_total = max(1, max_retries) + 1  # ilk deneme + /R kadar tekrar
+
+    def emit_retry_log(detail: str, reason: str, wait_seconds: str) -> None:
+        if on_log is None:
+            return
+        attempt = retry_counts.get(detail, 0) + 1
+        retry_counts[detail] = attempt
+        reason_part = f" - Sebep: {reason}" if reason else ""
+        msg = (
+            f"ROBOCOPY TEKRAR DENEME {attempt}/{max_attempts_total}: {detail}"
+            f"{reason_part} - {wait_seconds}sn beklenip tekrar denenecek."
+        )
+        try:
+            on_log(msg)
+        except Exception:
+            pass
 
     def emit_progress(percent: float) -> None:
         if on_progress is None:
@@ -189,6 +232,27 @@ def run_robocopy_with_progress(
                 files_seen += 1
                 current_file = file_match.group(1).strip()
                 emit_progress(0.0)
+
+            err_match = _ERROR_LINE_RE.match(line)
+            if err_match:
+                pending_error_detail = err_match.group(1).strip()
+                pending_error_reason = ""
+                log_fh.write(line + "\n")
+                continue
+
+            wait_match = _WAITING_LINE_RE.search(line)
+            if wait_match and pending_error_detail:
+                # Robocopy tam olarak SIMDI tekrar denemeye geciyor.
+                emit_retry_log(pending_error_detail, pending_error_reason, wait_match.group(1))
+                log_fh.write(line + "\n")
+                pending_error_detail = None
+                pending_error_reason = ""
+                continue
+
+            if pending_error_detail and not pending_error_reason:
+                # ERROR satirindan sonraki insan-okunur aciklama satiri
+                # (ornegin "The process cannot access the file...").
+                pending_error_reason = line.strip()
 
             # Yuzde-disi TUM satirlar (basliklar, dosya adlari, hatalar,
             # ozet) kendi yonettigimiz log dosyasina yazilir.

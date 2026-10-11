@@ -192,6 +192,8 @@ def delete_files_parallel(paths: list[str], max_workers: Optional[int] = None,
                            min_parallel_count: int = 20,
                            progress_callback: Optional[Callable[[int, int], None]] = None,
                            cancel_event: Optional[threading.Event] = None,
+                           max_retries: int = 1,
+                           logger: Optional[EngineLogger] = None,
                            ) -> tuple[int, list[tuple[str, str]]]:
     """
     Kaynak dosyalari PARALEL siler. Eski sequential `for v in verified:
@@ -201,53 +203,128 @@ def delete_files_parallel(paths: list[str], max_workers: Optional[int] = None,
     gibi gorunuyor). hash_files_parallel ile AYNI ThreadPoolExecutor deseni
     burada da gecikmeyi bircok istegi ayni anda ucusturarak ortuyor.
 
-    Donus: (basarili_sayisi, [(yol, hata_mesaji), ...]).
+    Kilitli dosyalar (paylasim ihlali) veya gecici ag kesintileri yuzunden
+    basarisiz olan silmeler, sadece basarisiz kalanlar uzerinde `max_retries`
+    kadar (artan bekleme suresiyle) tekrar denenir - dosyalar bu asamaya
+    gelmeden once zaten TAM olarak kopyalanip dogrulanmis oldugu icin, iş
+    kalici bir hataya (ornegin dosya gercekten silinemez durumda) carpmadikca
+    pes etmeden denemeye devam eder.
+
+    Donus: (basarili_sayisi, [(yol, hata_mesaji), ...]) - hata listesinde
+    sadece TUM denemeler tukendikten sonra HALA basarisiz olan dosyalar kalir.
     """
     if not paths:
         return 0, []
     if max_workers is None:
         max_workers = min(32, (os.cpu_count() or 4) * 4)
 
-    def _delete_one(path: str) -> Optional[str]:
+    def _delete_one(path: str) -> Optional[OSError]:
         try:
             os.remove(path)
             return None
         except FileNotFoundError:
             return None  # zaten yok - basarili sayilir
         except OSError as e:
-            return str(e)
+            return e
 
+    def _delete_batch(batch: list[str]) -> tuple[int, list[tuple[str, OSError]]]:
+        batch_errors: list[tuple[str, OSError]] = []
+        batch_success = 0
+        if len(batch) < min_parallel_count or max_workers <= 1:
+            for p in batch:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                err = _delete_one(p)
+                if err is None:
+                    batch_success += 1
+                else:
+                    batch_errors.append((p, err))
+            return batch_success, batch_errors
+
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_delete_one, p): p for p in batch}
+            for future in concurrent.futures.as_completed(futures):
+                path = futures[future]
+                err = future.result()
+                if err is None:
+                    batch_success += 1
+                else:
+                    batch_errors.append((path, err))
+                done += 1
+                if progress_callback and done % 5000 == 0:
+                    progress_callback(done, len(batch))
+                if cancel_event is not None and cancel_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+        return batch_success, batch_errors
+
+    total_success = 0
+    remaining = list(paths)
+    last_errors: list[tuple[str, OSError]] = []
+    attempts = max(1, max_retries)
+
+    for attempt in range(1, attempts + 1):
+        if not remaining or (cancel_event is not None and cancel_event.is_set()):
+            break
+        succ, errs = _delete_batch(remaining)
+        total_success += succ
+        last_errors = errs
+        if not errs:
+            remaining = []
+            break
+        remaining = [p for p, _ in errs]
+        if attempt < attempts:
+            wait_s = min(2.0 * attempt, 8.0)
+            if logger is not None:
+                in_use = sum(1 for _, e in errs if _is_file_in_use_error(e))
+                logger.warn(
+                    f"Silme basarisiz: {len(errs)} dosya (kilitli/kullanimda: {in_use}) - "
+                    f"{wait_s:.0f}sn beklenip tekrar denenecek (deneme {attempt}/{attempts}).",
+                    console=True,
+                )
+            time.sleep(wait_s)
+
+    return total_success, [(p, str(e)) for p, e in last_errors]
+
+
+def remove_empty_dirs(root: str) -> tuple[int, list[tuple[str, str]]]:
+    """Kaynak koku haricindeki tum bos klasorleri alttan uste dogru siler."""
+    removed = 0
     errors: list[tuple[str, str]] = []
-    success = 0
 
-    if len(paths) < min_parallel_count or max_workers <= 1:
-        for p in paths:
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            err = _delete_one(p)
-            if err is None:
-                success += 1
-            else:
-                errors.append((p, err))
-        return success, errors
+    def on_walk_error(error: OSError) -> None:
+        errors.append((error.filename or root, str(error)))
 
-    done = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_delete_one, p): p for p in paths}
-        for future in concurrent.futures.as_completed(futures):
-            path = futures[future]
-            err = future.result()
-            if err is None:
-                success += 1
-            else:
-                errors.append((path, err))
-            done += 1
-            if progress_callback and done % 5000 == 0:
-                progress_callback(done, len(paths))
-            if cancel_event is not None and cancel_event.is_set():
-                executor.shutdown(wait=False, cancel_futures=True)
-                break
-    return success, errors
+    for current_root, dirnames, _ in os.walk(root, topdown=False, onerror=on_walk_error):
+        for dirname in dirnames:
+            directory = os.path.join(current_root, dirname)
+            if os.path.islink(directory):
+                continue
+            try:
+                if not os.listdir(directory):
+                    os.rmdir(directory)
+                    removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                errors.append((directory, str(error)))
+    return removed, errors
+
+
+
+# WinError 32 = ERROR_SHARING_VIOLATION ("dosya baska bir islem tarafindan
+# kullaniliyor"). errno 13 (Permission denied) bazen ayni durumda POSIX
+# tarafinda da gorulur, o yuzden ikisi de kontrol edilir.
+_SHARING_VIOLATION_WINERROR = 32
+
+
+def _is_file_in_use_error(e: OSError) -> bool:
+    """Hata, hedef/kaynak dosyanin BASKA BIR ISLEM tarafindan acik/kilitli
+    oldugunu (paylasim ihlali) mi gosteriyor tespit eder."""
+    if getattr(e, "winerror", None) == _SHARING_VIOLATION_WINERROR:
+        return True
+    return isinstance(e, PermissionError)
 
 
 def _retry_and_reverify_files(
@@ -285,6 +362,7 @@ def _retry_and_reverify_files(
             return item, False
         dst_path = item.dst_path or os.path.join(job.destination_path, item.rel)
         last_err = ""
+        in_use = False  # son hatanin "baska bir islem tarafindan kullaniliyor" olup olmadigi
         for attempt in range(1, max_attempts + 1):
             if cancel_event is not None and cancel_event.is_set():
                 last_err = "Kullanici tarafindan durduruldu"
@@ -294,13 +372,22 @@ def _retry_and_reverify_files(
                 shutil.copy2(info.src, dst_path)
             except OSError as e:
                 last_err = str(e)
-                time.sleep(min(2.0 * attempt, 8.0))
+                in_use = _is_file_in_use_error(e)
+                wait_s = min(2.0 * attempt, 8.0)
+                if in_use:
+                    logger.warn(
+                        f"KULLANIMDA: {item.rel} baska bir islem/uygulama tarafindan kullaniliyor "
+                        f"(deneme {attempt}/{max_attempts}) - {wait_s:.0f}sn beklenip tekrar denenecek.",
+                        console=True,
+                    )
+                time.sleep(wait_s)
                 continue
 
             try:
                 sz = os.path.getsize(dst_path)
             except OSError as e:
                 last_err = str(e)
+                in_use = _is_file_in_use_error(e)
                 time.sleep(min(2.0 * attempt, 8.0))
                 continue
             item.size = sz  # her denemede hedefte GERCEKTE ne var onu yansitir (MISSING'den duzelen dosyada 0'da KALMASIN)
@@ -319,9 +406,13 @@ def _retry_and_reverify_files(
                 item.result = "OK"
                 return item, True
             last_err = "dogrulama basarisiz (hash/boyut hala uyusmuyor)"
+            in_use = False
 
         if last_err:
-            item.dst_hash = f"(tekrar denendi, basarisiz: {last_err})"
+            if in_use:
+                item.dst_hash = f"(tekrar denendi, hala baska bir islem tarafindan kullaniliyor: {last_err})"
+            else:
+                item.dst_hash = f"(tekrar denendi, basarisiz: {last_err})"
         return item, False
 
     fixed: list[_PendingVerify] = []
@@ -602,6 +693,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             job.source_path, job.destination_path, job.file_filter,
             job.older_than_days, job.max_retries, job.robocopy_threads, str(robocopy_log),
             on_progress=on_progress, cancel_event=cancel_event, total_files=len(src_files),
+            on_log=lambda msg: logger.warn(msg, console=True),
         )
 
         if exit_code == -1:
@@ -810,10 +902,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 if job_ok:
                     stage("Kaynak dosyalar siliniyor")
                     logger.warn(f"Kaynak dosyalar siliniyor... ({len(src_files)} dosya, dogrulama atlandi)")
+                    src_paths = [f.path for f in src_files]
                     del_ok, del_errors = delete_files_parallel(
-                        [f.path for f in src_files], max_workers=job.robocopy_threads,
+                        src_paths, max_workers=job.robocopy_threads,
                         progress_callback=lambda done, tot: logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya"),
                         cancel_event=cancel_event,
+                        max_retries=job.max_retries, logger=logger,
                     )
                     for p, err in del_errors:
                         logger.error(f"Silinemedi: {p} — {err}", console=False)
@@ -821,6 +915,11 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         logger.success(f"Tum kaynak dosyalar silindi ({del_ok} dosya).")
                     else:
                         logger.warn(f"{del_ok} dosya silindi, {len(del_errors)} dosya silinemedi.")
+                    dirs_removed, dir_errors = remove_empty_dirs(job.source_path)
+                    if dirs_removed:
+                        logger.info(f"Bos kalan {dirs_removed} kaynak klasoru de silindi.")
+                    for d, err in dir_errors:
+                        logger.warn(f"Bos klasor silinemedi: {d} — {err}", console=False)
                 else:
                     logger.warn("Dogrulama atlandi (VerificationMode=None) ve robocopy basarisiz raporladi — kaynak SILINMEDI.")
             else:
@@ -834,10 +933,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 if verified:
                     stage("Kaynak dosyalar siliniyor")
                     logger.warn(f"Kaynak dosyalar siliniyor... ({len(verified)} dogrulanmis dosya)")
+                    verified_paths = [v.src_file for v in verified]
                     del_ok, del_errors = delete_files_parallel(
-                        [v.src_file for v in verified], max_workers=job.robocopy_threads,
+                        verified_paths, max_workers=job.robocopy_threads,
                         progress_callback=lambda done, tot: logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya"),
                         cancel_event=cancel_event,
+                        max_retries=job.max_retries, logger=logger,
                     )
                     for p, err in del_errors:
                         logger.error(f"Silinemedi: {p} — {err}", console=False)
@@ -845,6 +946,11 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         logger.success(f"Dogrulanan {del_ok} kaynak dosya silindi.")
                     else:
                         logger.warn(f"{del_ok} dosya silindi, {len(del_errors)} dosya silinemedi (detay: log dosyasi).")
+                    dirs_removed, dir_errors = remove_empty_dirs(job.source_path)
+                    if dirs_removed:
+                        logger.info(f"Bos kalan {dirs_removed} kaynak klasoru de silindi.")
+                    for d, err in dir_errors:
+                        logger.warn(f"Bos klasor silinemedi: {d} — {err}", console=False)
                 else:
                     logger.warn("Silinecek dogrulanmis dosya yok — kaynak SILINMEDI.")
 

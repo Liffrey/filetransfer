@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QSplitter, QPlainTextEdit, QMessageBox,
     QStatusBar, QHeaderView, QFrame, QLabel, QProgressBar, QInputDialog, QLineEdit,
+    QDialog,
 )
 
 from engine.config import JobConfigStore, TransferJob, DEFAULT_LOG_DIR
@@ -58,6 +59,18 @@ from resources import get_app_icon_path
 COLUMNS = ["Job Adi", "Kaynak", "Hedef", "Yas(gun)", "Sil", "Aktif", "Zamanlama", "Son Calisma", "Durum", "Log", "Hash Log"]
 LOG_COL = COLUMNS.index("Log")
 HASH_LOG_COL = COLUMNS.index("Hash Log")
+
+# "Hakkinda" penceresinde gosterilecek metin - burayi diledigin gibi duzenleyebilirsin.
+ABOUT_TEXT = """Transfer Console
+
+        SMB üzerinden dosya kopyalama amacıyla kullanılmaktadır.
+
+        Version 1.17 
+
+        11-08-2026
+
+        Buğra
+"""
 
 TASK_COLUMNS = ["Job", "Durum", "Asama", "Ilerleme", "Sure", ""]
 TASK_JOB_COL, TASK_STATUS_COL, TASK_STAGE_COL, TASK_PROGRESS_COL, TASK_DURATION_COL, TASK_CLOSE_COL = range(len(TASK_COLUMNS))
@@ -193,6 +206,7 @@ class MainWindow(QMainWindow):
         self.btn_refresh = QPushButton("⟳ Yenile")
         self.btn_open_config = QPushButton("Config Ac")
         self.btn_open_logs_folder = QPushButton("Log Klasoru")
+        self.btn_about = QPushButton("Hakkinda")
 
         def add_separator():
             line = QFrame()
@@ -211,6 +225,8 @@ class MainWindow(QMainWindow):
         add_separator()
         for b in (self.btn_cred, self.btn_refresh, self.btn_open_config, self.btn_open_logs_folder):
             toolbar.addWidget(b)
+        add_separator()
+        toolbar.addWidget(self.btn_about)
 
         toolbar.addWidget(self.btn_theme)
 
@@ -313,6 +329,7 @@ class MainWindow(QMainWindow):
         self.btn_refresh.clicked.connect(self.refresh_grid)
         self.btn_open_config.clicked.connect(self._on_open_config)
         self.btn_open_logs_folder.clicked.connect(self._on_open_logs_folder)
+        self.btn_about.clicked.connect(self._on_about)
         self.btn_theme.toggled.connect(self._on_theme_toggled)
 
         self._apply_theme(self.theme, persist=False)
@@ -860,6 +877,23 @@ class MainWindow(QMainWindow):
             os.startfile(str(folder))  # type: ignore[attr-defined]
         else:
             QMessageBox.information(self, "Log Klasoru", str(folder))
+
+    def _on_about(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Hakkinda")
+        dlg.setMinimumWidth(360)
+        layout = QVBoxLayout(dlg)
+        label = QLabel(ABOUT_TEXT)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        btn_ok = QPushButton("Tamam")
+        btn_ok.setProperty("primary", True)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_ok)
+        layout.addLayout(btn_row)
+        dlg.exec()
 
     def closeEvent(self, event):
         running = [w for w in self.workers.values() if w.isRunning()]
