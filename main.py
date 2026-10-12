@@ -18,6 +18,19 @@ import os
 import sys
 from pathlib import Path
 
+# build_exe.py --windowed (PyInstaller GUI-subsystem) exe'lerinde konsol
+# ATANMADIGI icin sys.stdout/stderr None olur - CLI modu (--run-job, Gorev
+# Zamanlayici'nin cagirdigi yol) print()/sys.stdout.write() kullandigindan
+# ilk cikti satirinda AttributeError ile CRASH ederdi. NUL/devnull'a
+# yonlendirip GUI davranisini (konsol penceresi acilmaz) BOZMADAN CLI'in
+# calismasini garanti ediyoruz.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+from resources import get_app_icon_path
+
 
 def get_default_data_dir() -> Path:
     """Windows'ta %ProgramData%\\DataTransferTool, diger platformlarda ~/.datatransfertool."""
@@ -46,13 +59,23 @@ def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
         print(f"Job '{job_name}' devre disi, atlaniyor.")
         return 0
 
+    def print_progress(p) -> None:
+        # Tek satiri \r ile guncelleyerek yazar (robocopy'nin kendi ilerleme
+        # gostergesi gibi) - konsoldan elle calistirinca gorulur, Gorev
+        # Zamanlayici'nin gorulmez stdout'unda ise zararsizdir.
+        name = p.current_file or "..."
+        sys.stdout.write(f"\r  {name[:60]:<60s} %{p.percent:5.1f}")
+        sys.stdout.flush()
+
     result = run_transfer(job, run_id=run_id, credential_store=cred_store,
-                           on_log=lambda line: print(line), lock_dir=str(data_dir / "locks"))
+                           on_log=lambda line: print(line), lock_dir=str(data_dir / "locks"),
+                           on_progress=print_progress)
+    print()  # ilerleme satirindan sonra imleci yeni satira gecir
 
     status = "Basarili" if result.overall_success else "Hatali"
     message = result.error_message or f"{result.verified_files} dosya dogrulandi"
     ok = config_store.update_run_result(
-        job_name, status, message, result.log_file, result.hash_log_file,
+        job_name, status, message, result.log_file, result.hash_log_file, result.report_file,
     )
     if not ok:
         print("UYARI: Job durumu config'e yazilamadi (guvenlik engeli veya IO hatasi).", file=sys.stderr)
@@ -61,16 +84,32 @@ def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
 
 
 def run_gui(config_path: str, cred_dir: str) -> int:
+    from PySide6.QtCore import QSettings
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
     from gui.main_window import MainWindow
-    from gui.style import build_app_stylesheet
+    from gui.style import THEME_LIGHT, build_app_palette, build_app_stylesheet
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    app.setStyleSheet(build_app_stylesheet())
+
+    icon_path = get_app_icon_path()
+    if icon_path is not None:
+        app.setWindowIcon(QIcon(str(icon_path)))
+
+    settings = QSettings("DataTransferTool", "TransferConsole")
+    theme = str(settings.value("ui/theme", THEME_LIGHT))
+    app.setPalette(build_app_palette(theme))
+    app.setStyleSheet(build_app_stylesheet(theme))
 
     exe_path = sys.executable if not getattr(sys, "frozen", False) else sys.argv[0]
-    window = MainWindow(config_path=config_path, cred_dir=cred_dir, exe_path=exe_path)
+    window = MainWindow(
+        config_path=config_path,
+        cred_dir=cred_dir,
+        exe_path=exe_path,
+        settings=settings,
+        initial_theme=theme,
+    )
     window.show()
     return app.exec()
 

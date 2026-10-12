@@ -45,6 +45,7 @@ def register_scheduled_task(
     schedule_weekly_day: str,
     run_as_user: str,
     config_path: str,
+    run_as_password: Optional[str] = None,
 ) -> ScheduleResult:
     """
     Job'u Windows Gorev Zamanlayici'ya kaydeder. exe_path, --run-job
@@ -74,7 +75,18 @@ def register_scheduled_task(
     if run_as_user.upper() == "SYSTEM":
         args += ["/RU", "SYSTEM"]
     else:
-        args += ["/RU", run_as_user, "/RP", "*"]  # /RP * -> parola icin interaktif sorar
+        # /RP '*' schtasks'a parolayi ETKILESIMLI olarak sormasini soyler -
+        # bu surec subprocess.run ile stdin'i etkilesimli olmayan bir
+        # baglamdan cagrildigi icin ya hemen hata verir ya da timeout'a
+        # kadar askida kalirdi. Gercek parola olmadan gorev olusturmayi
+        # tamamen REDDEDIYORUZ (kullaniciya net bir hata donuyoruz).
+        if not run_as_password:
+            return ScheduleResult(
+                False,
+                f"'{run_as_user}' hesabiyla calistirmak icin parola gerekli. "
+                "SYSTEM disinda bir hesap secildiyse parola saglanmalidir.",
+            )
+        args += ["/RU", run_as_user, "/RP", run_as_password]
 
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=30)

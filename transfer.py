@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import html
 import hashlib
 import json
 import os
+import shutil
 import smtplib
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from engine.logutil import EngineLogger, DiskInfo, get_disk_info, format_size, H
 from engine.credentials import CredentialStore, resolve_unc_server
 from engine.scanner import scan_directory, build_rel_index
 from engine.joblock import JobLock, JobLockError
+from engine.robocopy_runner import run_robocopy_with_progress, RobocopyProgress
 
 
 @dataclass(slots=True)
@@ -62,6 +64,18 @@ class FailedFileInfo:
     dst_hash: str
 
 
+@dataclass(slots=True)
+class _PendingVerify:
+    """Ilk denemede basarisiz/eksik cikan, tekrar deneme kuyruguna alinan bir dosya.
+    dst_path None ise hedefte HIC yok (rel'den yeniden hesaplanir)."""
+    rel: str
+    src_hash: str
+    dst_hash: str
+    size: int
+    result: str  # MISSING | MISMATCH | ERROR (basarili olursa OK'e cevrilir)
+    dst_path: Optional[str]
+
+
 @dataclass
 class TransferResult:
     job_name: str
@@ -71,6 +85,7 @@ class TransferResult:
     robocopy_log: str = ""
     hash_log_file: str = ""
     summary_json: str = ""
+    report_file: str = ""
     run_id: str = ""
     total_files: int = 0
     verified_files: int = 0
@@ -115,6 +130,108 @@ def _robocopy_exit_description(code: int) -> list[str]:
     if code & 16:
         parts.append("FATAL HATA")
     return parts
+
+
+def _render_html_report(summary: dict) -> str:
+    """Calisma ozetini dis bagimliligi olmayan, tarayicida acilabilir HTML'e cevirir."""
+    run_info = summary.get("run_info", {})
+    result = summary.get("result", {})
+    successful = bool(result.get("success"))
+    cancelled = result.get("error_message") == "Kullanici tarafindan durduruldu"
+    status_text = "BASARILI" if successful else ("DURDURULDU" if cancelled else "HATALI")
+    status_color = "#18794e" if successful else ("#8a5a00" if cancelled else "#b42318")
+
+    def esc(value) -> str:
+        return html.escape(str(value if value not in (None, "") else "-"))
+
+    elapsed = float(result.get("elapsed_seconds") or 0)
+    transferred_bytes = int(result.get("transferred_bytes") or 0)
+    speed = f"{transferred_bytes / elapsed / 1024 / 1024:.2f} MB/sn" if elapsed > 0 else "-"
+    metrics = [
+        ("Toplam dosya", result.get("total", 0)),
+        ("Dogrulanan", result.get("verified", 0)),
+        ("Basarisiz", result.get("failed", 0)),
+        ("Eksik", result.get("missing", 0)),
+        ("Atlanan", result.get("skipped", 0)),
+        ("Aktarilan", format_size(transferred_bytes)),
+        ("Ortalama hiz", speed),
+        ("Toplam sure", f"{elapsed:.1f} sn"),
+    ]
+    metric_html = "".join(
+        f'<div class="metric"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>'
+        for label, value in metrics
+    )
+
+    def file_link(label: str, path: str) -> str:
+        if not path:
+            return ""
+        href = Path(path).resolve().as_uri()
+        return f'<a href="{esc(href)}">{esc(label)}</a>'
+
+    links = summary.get("log_files", {})
+    link_html = " · ".join(
+        link for label, key in (("Transfer logu", "main_log"), ("Robocopy logu", "robocopy_log"), ("Hash logu", "hash_log"))
+        if (link := file_link(label, links.get(key, "")))
+    ) or "Log dosyasi yok"
+
+    failed_files = summary.get("failed_files", [])
+    failed_rows = "".join(
+        f"<tr><td>{esc(item.get('rel'))}</td><td>{esc(item.get('src_hash'))}</td>"
+        f"<td>{esc(item.get('dst_hash'))}</td></tr>"
+        for item in failed_files[:500]
+    )
+    if len(failed_files) > 500:
+        failed_rows += f"<tr><td colspan=\"3\">Ilk 500 kayit gosteriliyor; tam liste hash/JSON raporunda ({len(failed_files)} dosya).</td></tr>"
+    missing_files = summary.get("missing_files", [])
+    missing_rows = "".join(
+        f"<tr><td>{esc(item.get('rel') if isinstance(item, dict) else item)}</td></tr>"
+        for item in missing_files[:500]
+    )
+    if len(missing_files) > 500:
+        missing_rows += f"<tr><td>Ilk 500 kayit gosteriliyor; tam liste JSON raporunda ({len(missing_files)} dosya).</td></tr>"
+    error_message = result.get("error_message", "")
+    error_html = f'<p class="error">{esc(error_message)}</p>' if error_message else ""
+
+    return f"""<!doctype html>
+<html lang="tr">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(summary.get('job_name'))} - Transfer raporu</title>
+<style>
+body {{ margin: 0; background: #f3f5f7; color: #17212b; font: 15px/1.5 "Segoe UI", sans-serif; }}
+main {{ max-width: 1080px; margin: 32px auto; padding: 0 20px; }}
+header {{ display: flex; justify-content: space-between; align-items: start; gap: 20px; border-bottom: 1px solid #d7dee5; padding-bottom: 18px; }}
+h1 {{ margin: 0; font-size: 26px; }} h2 {{ margin: 28px 0 10px; font-size: 18px; }}
+.status {{ color: {status_color}; border: 1px solid currentColor; padding: 4px 10px; font-weight: 700; }}
+.muted {{ color: #536273; }} .error {{ padding: 10px 12px; color: #8f1d16; background: #fdecea; }}
+.metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: #d7dee5; border: 1px solid #d7dee5; }}
+.metric {{ background: white; padding: 12px 14px; }} .metric span {{ display: block; color: #536273; font-size: 13px; }}
+.metric strong {{ display: block; margin-top: 4px; font-size: 18px; overflow-wrap: anywhere; }}
+table {{ width: 100%; border-collapse: collapse; background: white; }} th, td {{ padding: 9px 10px; text-align: left; border-bottom: 1px solid #e1e6eb; overflow-wrap: anywhere; }}
+th {{ background: #e9eef2; }} .details {{ display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 6px 14px; }}
+.details strong {{ overflow-wrap: anywhere; }} a {{ color: #075e9c; }}
+@media (max-width: 600px) {{ main {{ margin: 18px auto; }} header {{ display: block; }} .status {{ display: inline-block; margin-top: 12px; }} .details {{ grid-template-columns: 1fr; gap: 0; }} }}
+</style>
+<main>
+<header><div><h1>{esc(summary.get('job_name'))}</h1><div class="muted">Run ID: {esc(summary.get('run_id'))}</div></div><span class="status">{status_text}</span></header>
+{error_html}
+<h2>Ozet</h2><section class="metrics">{metric_html}</section>
+<h2>Calisma bilgileri</h2><div class="details">
+<span>Baslangic</span><strong>{esc(summary.get('started_at'))}</strong>
+<span>Bitis</span><strong>{esc(summary.get('finished_at'))}</strong>
+<span>Kaynak</span><strong>{esc(run_info.get('source'))}</strong>
+<span>Hedef</span><strong>{esc(run_info.get('destination'))}</strong>
+<span>Dosya filtresi</span><strong>{esc(run_info.get('file_filter'))}</strong>
+<span>Yas siniri</span><strong>{esc(run_info.get('age_days'))} gun</strong>
+<span>Dogrulama</span><strong>{esc(run_info.get('verify_mode'))}</strong>
+<span>Transfer sonrasi sil</span><strong>{esc(run_info.get('delete_after'))}</strong>
+<span>Robocopy cikis kodu</span><strong>{esc(result.get('robocopy_exit'))}</strong>
+<span>Robocopy suresi</span><strong>{esc(result.get('duration'))}</strong>
+</div>
+<h2>Basarisiz dosyalar</h2><table><thead><tr><th>Dosya</th><th>Kaynak hash</th><th>Hedef sonucu</th></tr></thead><tbody>{failed_rows or '<tr><td colspan="3">Basarisiz dosya yok</td></tr>'}</tbody></table>
+<h2>Eksik dosyalar</h2><table><thead><tr><th>Dosya</th></tr></thead><tbody>{missing_rows or '<tr><td>Eksik dosya yok</td></tr>'}</tbody></table>
+<h2>Loglar</h2><p>{link_html}</p>
+</main></html>"""
 
 
 def send_alert_mail(smtp_server: str, mail_from: str, mail_to: list[str],
@@ -175,62 +292,252 @@ def hash_files_parallel(paths: list[str], max_workers: Optional[int] = None,
     return results
 
 
-def run_robocopy(source: str, destination: str, file_filter: str,
-                  older_than_days: int, max_retries: int, threads: int,
-                  robocopy_log: str, cancel_event: Optional["threading.Event"] = None
-                  ) -> tuple[int, "datetime.timedelta"]:
+def delete_files_parallel(paths: list[str], max_workers: Optional[int] = None,
+                           min_parallel_count: int = 20,
+                           progress_callback: Optional[Callable[[int, int], None]] = None,
+                           cancel_event: Optional[threading.Event] = None,
+                           max_retries: int = 1,
+                           logger: Optional[EngineLogger] = None,
+                           ) -> tuple[int, list[tuple[str, str]]]:
     """
-    Robocopy'yi subprocess ile calistirir. Liste-tabanli argv kullanildigi
-    icin Windows'un kendi quoting mekanizmasi devreye girer; "E:\\" gibi
-    trailing-backslash yollarda PowerShell'de yasadigimiz kacis karakteri
-    sorunu burada olusmaz (subprocess, argv'yi doğrudan CreateProcess'e
-    Win32 API duzeyinde iletir, cmd.exe stringi ayristirma katmani devreye
-    girmez).
+    Kaynak dosyalari PARALEL siler. Eski sequential `for v in verified:
+    os.remove(...)` dongusu, ozellikle UNC/ag yollarinda dosya basina ayri
+    bir round-trip gecikmesi biriktirip 200bin+ dosyada SAATLERCE surebiliyor
+    ve bazen tamamlanamiyordu (agir latency x cok dosya = pratikte "silemiyor"
+    gibi gorunuyor). hash_files_parallel ile AYNI ThreadPoolExecutor deseni
+    burada da gecikmeyi bircok istegi ayni anda ucusturarak ortuyor.
 
-    cancel_event verilirse, Popen+poll dongusu ile calistirilir ve event
-    set edildiginde robocopy sureci terminate edilir (GUI'deki "Durdur"
-    butonu icin). Exit code bu durumda -1 (kullanici tarafindan durduruldu)
-    olarak doner.
+    Kilitli dosyalar (paylasim ihlali) veya gecici ag kesintileri yuzunden
+    basarisiz olan silmeler, sadece basarisiz kalanlar uzerinde `max_retries`
+    kadar (artan bekleme suresiyle) tekrar denenir - dosyalar bu asamaya
+    gelmeden once zaten TAM olarak kopyalanip dogrulanmis oldugu icin, iş
+    kalici bir hataya (ornegin dosya gercekten silinemez durumda) carpmadikca
+    pes etmeden denemeye devam eder.
+
+    Donus: (basarili_sayisi, [(yol, hata_mesaji), ...]) - hata listesinde
+    sadece TUM denemeler tukendikten sonra HALA basarisiz olan dosyalar kalir.
     """
-    args = [
-        "robocopy",
-        source,
-        destination,
-        file_filter,
-        "/E",
-        "/COPY:DAT",
-        f"/MT:{max(1, min(128, threads))}",
-        f"/R:{max_retries}",
-        "/W:5",
-        f"/LOG+:{robocopy_log}",
-        "/NP",
-        "/BYTES",
-        "/NDL",
-    ]
-    if older_than_days > 0:
-        args.append(f"/MINAGE:{older_than_days}")
+    if not paths:
+        return 0, []
+    if max_workers is None:
+        max_workers = min(32, (os.cpu_count() or 4) * 4)
 
-    start = datetime.datetime.now()
+    def _delete_one(path: str) -> Optional[OSError]:
+        try:
+            os.remove(path)
+            return None
+        except FileNotFoundError:
+            return None  # zaten yok - basarili sayilir
+        except OSError as e:
+            return e
 
-    if cancel_event is None:
-        proc = subprocess.run(args, capture_output=True, text=True)
-        duration = datetime.datetime.now() - start
-        return proc.returncode, duration
+    def _delete_batch(batch: list[str]) -> tuple[int, list[tuple[str, OSError]]]:
+        batch_errors: list[tuple[str, OSError]] = []
+        batch_success = 0
+        if len(batch) < min_parallel_count or max_workers <= 1:
+            for p in batch:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                err = _delete_one(p)
+                if err is None:
+                    batch_success += 1
+                else:
+                    batch_errors.append((p, err))
+            return batch_success, batch_errors
 
-    # Iptal edilebilir mod: Popen + poll dongusu
-    popen = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    while popen.poll() is None:
-        if cancel_event.is_set():
-            popen.terminate()
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_delete_one, p): p for p in batch}
+            for future in concurrent.futures.as_completed(futures):
+                path = futures[future]
+                err = future.result()
+                if err is None:
+                    batch_success += 1
+                else:
+                    batch_errors.append((path, err))
+                done += 1
+                if progress_callback and done % 5000 == 0:
+                    progress_callback(done, len(batch))
+                if cancel_event is not None and cancel_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+        return batch_success, batch_errors
+
+    total_success = 0
+    remaining = list(paths)
+    last_errors: list[tuple[str, OSError]] = []
+    attempts = max(1, max_retries)
+
+    for attempt in range(1, attempts + 1):
+        if not remaining or (cancel_event is not None and cancel_event.is_set()):
+            break
+        succ, errs = _delete_batch(remaining)
+        total_success += succ
+        last_errors = errs
+        if not errs:
+            remaining = []
+            break
+        remaining = [p for p, _ in errs]
+        if attempt < attempts:
+            wait_s = min(2.0 * attempt, 8.0)
+            if logger is not None:
+                in_use = sum(1 for _, e in errs if _is_file_in_use_error(e))
+                logger.warn(
+                    f"Silme basarisiz: {len(errs)} dosya (kilitli/kullanimda: {in_use}) - "
+                    f"{wait_s:.0f}sn beklenip tekrar denenecek (deneme {attempt}/{attempts}).",
+                    console=True,
+                )
+            time.sleep(wait_s)
+
+    return total_success, [(p, str(e)) for p, e in last_errors]
+
+
+def remove_empty_dirs(root: str) -> tuple[int, list[tuple[str, str]]]:
+    """Kaynak koku haricindeki tum bos klasorleri alttan uste dogru siler."""
+    removed = 0
+    errors: list[tuple[str, str]] = []
+
+    def on_walk_error(error: OSError) -> None:
+        errors.append((error.filename or root, str(error)))
+
+    for current_root, dirnames, _ in os.walk(root, topdown=False, onerror=on_walk_error):
+        for dirname in dirnames:
+            directory = os.path.join(current_root, dirname)
+            if os.path.islink(directory):
+                continue
             try:
-                popen.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                popen.kill()
-            duration = datetime.datetime.now() - start
-            return -1, duration
-        time.sleep(0.3)
-    duration = datetime.datetime.now() - start
-    return popen.returncode, duration
+                if not os.listdir(directory):
+                    os.rmdir(directory)
+                    removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                errors.append((directory, str(error)))
+    return removed, errors
+
+
+
+# WinError 32 = ERROR_SHARING_VIOLATION ("dosya baska bir islem tarafindan
+# kullaniliyor"). errno 13 (Permission denied) bazen ayni durumda POSIX
+# tarafinda da gorulur, o yuzden ikisi de kontrol edilir.
+_SHARING_VIOLATION_WINERROR = 32
+
+
+def _is_file_in_use_error(e: OSError) -> bool:
+    """Hata, hedef/kaynak dosyanin BASKA BIR ISLEM tarafindan acik/kilitli
+    oldugunu (paylasim ihlali) mi gosteriyor tespit eder."""
+    if getattr(e, "winerror", None) == _SHARING_VIOLATION_WINERROR:
+        return True
+    return isinstance(e, PermissionError)
+
+
+def _retry_and_reverify_files(
+    job: TransferJob,
+    hash_table: dict[str, SourceFileInfo],
+    pending: list[_PendingVerify],
+    logger: EngineLogger,
+    cancel_event: Optional[threading.Event],
+) -> tuple[list[_PendingVerify], list[_PendingVerify]]:
+    """
+    Ilk denemede basarisiz/eksik cikan dosyalari (genellikle robocopy /MT
+    coklu-thread calisirken kaynakta gecici bir paylasim ihlali, ya da tek
+    tek dosyalarda olusan agir/gecici ag hatalari yuzunden) TEK TEK yeniden
+    kopyalar ve yeniden dogrular. 200bin dosyadan sadece 1-2'sinin basarisiz
+    oldugu (cok yaygin) senaryoda, TUM job'u basarisiz/silinmez saymak yerine
+    bu birkac dosyayi otomatik onarmayi dener.
+
+    Donus: (fixed, still_failed) - ikisi de _PendingVerify listesi; fixed
+    olanlarin dst_hash/size/dst_path alanlari YENIDEN dogrulanmis degerlerle
+    guncellenmis olarak, result="OK" ile doner.
+    """
+    if not pending:
+        return [], []
+
+    max_attempts = max(1, job.max_retries)
+    # job.robocopy_threads TUM job-genelinde tek paralellik ayari (scan/robocopy/
+    # hash/silme hepsi bunu kullanir) - burada da AYNI ayara uyulur, aksi halde
+    # kullanici hassas/yavas bir ag icin dusuk tutsa bile tekrar deneme asamasi
+    # sabit bir CPU-bazli deger ile ag'i yine de yuklerdi.
+    max_workers = max(1, min(128, job.robocopy_threads))
+
+    def _retry_one(item: _PendingVerify) -> tuple[_PendingVerify, bool]:
+        info = hash_table.get(item.rel.lower())
+        if info is None:
+            return item, False
+        dst_path = item.dst_path or os.path.join(job.destination_path, item.rel)
+        last_err = ""
+        in_use = False  # son hatanin "baska bir islem tarafindan kullaniliyor" olup olmadigi
+        for attempt in range(1, max_attempts + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                last_err = "Kullanici tarafindan durduruldu"
+                break
+            try:
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                shutil.copy2(info.src, dst_path)
+            except OSError as e:
+                last_err = str(e)
+                in_use = _is_file_in_use_error(e)
+                wait_s = min(2.0 * attempt, 8.0)
+                if in_use:
+                    logger.warn(
+                        f"KULLANIMDA: {item.rel} baska bir islem/uygulama tarafindan kullaniliyor "
+                        f"(deneme {attempt}/{max_attempts}) - {wait_s:.0f}sn beklenip tekrar denenecek.",
+                        console=True,
+                    )
+                time.sleep(wait_s)
+                continue
+
+            try:
+                sz = os.path.getsize(dst_path)
+            except OSError as e:
+                last_err = str(e)
+                in_use = _is_file_in_use_error(e)
+                time.sleep(min(2.0 * attempt, 8.0))
+                continue
+            item.size = sz  # her denemede hedefte GERCEKTE ne var onu yansitir (MISSING'den duzelen dosyada 0'da KALMASIN)
+
+            if job.verification_mode == "FullHash":
+                dh = _sha256_of_file(dst_path)
+                ok = dh is not None and dh == info.hash
+                dst_hash_final = dh or "(okunamadi)"
+            else:
+                ok = sz == info.size
+                dst_hash_final = f"(boyut:{format_size(sz)})"
+
+            if ok:
+                item.dst_hash = dst_hash_final
+                item.dst_path = dst_path
+                item.result = "OK"
+                return item, True
+            last_err = "dogrulama basarisiz (hash/boyut hala uyusmuyor)"
+            in_use = False
+
+        if last_err:
+            if in_use:
+                item.dst_hash = f"(tekrar denendi, hala baska bir islem tarafindan kullaniliyor: {last_err})"
+            else:
+                item.dst_hash = f"(tekrar denendi, basarisiz: {last_err})"
+        return item, False
+
+    fixed: list[_PendingVerify] = []
+    still_failed: list[_PendingVerify] = []
+
+    if len(pending) < 4 or max_workers <= 1:
+        for item in pending:
+            result_item, ok = _retry_one(item)
+            (fixed if ok else still_failed).append(result_item)
+            logger.log(f"TEKRAR DENEME {'BASARILI' if ok else 'BASARISIZ'}: {result_item.rel}",
+                       "SUCCESS" if ok else "ERROR", console=False)
+        return fixed, still_failed
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_retry_one, item): item for item in pending}
+        for future in concurrent.futures.as_completed(futures):
+            result_item, ok = future.result()
+            (fixed if ok else still_failed).append(result_item)
+            logger.log(f"TEKRAR DENEME {'BASARILI' if ok else 'BASARISIZ'}: {result_item.rel}",
+                       "SUCCESS" if ok else "ERROR", console=False)
+    return fixed, still_failed
 
 
 def check_disk_and_alert(destination: str, projected_extra_bytes: int, job: TransferJob,
@@ -290,7 +597,9 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                   credential_store: Optional[CredentialStore] = None,
                   on_log: Optional[ProgressCallback] = None,
                   cancel_event: Optional[threading.Event] = None,
-                  lock_dir: Optional[str] = None) -> TransferResult:
+                  lock_dir: Optional[str] = None,
+                  on_progress: Optional[Callable[[RobocopyProgress], None]] = None,
+                  on_stage: Optional[Callable[[str], None]] = None) -> TransferResult:
     """
     Bir job'u calistirir: yas filtreli robocopy + hash/boyut dogrulama +
     disk kontrolu + log/hashlog/JSON-ozet uretimi.
@@ -302,6 +611,15 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
               GUI'den elle "Simdi Calistir" derken Gorev Zamanlayici'nin da
               tetiklemesi gibi) TEKRAR calistirilmasi engellenir. Verilmezse
               kilit kontrolu YAPILMAZ (geriye donuk uyumluluk icin opsiyonel).
+    on_progress: robocopy calisirken canli olarak (dosya adi, yuzde) bilgisini
+                 ileten opsiyonel callback. NOT: bu, o an kopyalanan TEK
+                 DOSYANIN yuzdesidir - robocopy'nin dogasi geregi tum job'un
+                 toplam ilerlemesini DEGIL, mevcut dosyanin ilerlemesini verir.
+    on_stage: job'un hangi ASAMADA oldugunu ("Taraniyor", "Robocopy
+              calisiyor", "Dogrulaniyor" vb.) bildiren opsiyonel callback.
+              Birden fazla job ayni anda calisirken GUI'nin her satirda
+              (dosya yuzdesi yerine) anlamli bir asama gostermesi icindir -
+              bkz. main_window.py'deki gorev listesi (vCenter tarzi).
     """
     if run_id is None:
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -309,28 +627,90 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
     safe_name = sanitize_filename(job.name)
     log_dir = Path(job.log_dir or "C:\\TransferLogs")
     log_dir.mkdir(parents=True, exist_ok=True)
+    run_started_at = datetime.datetime.now().astimezone()
+    run_started_clock = time.monotonic()
 
     log_file = log_dir / f"Transfer_{safe_name}_{run_id}.log"
     robocopy_log = log_dir / f"Robocopy_{safe_name}_{run_id}.log"
     hash_log_file = log_dir / f"HashLog_{safe_name}_{run_id}.log"
     summary_json = log_dir / f"Summary_{safe_name}_{run_id}.json"
+    report_html = log_dir / f"Report_{safe_name}_{run_id}.html"
 
     logger = EngineLogger(log_file)
     if on_log:
         original_log = logger.log
-        def hooked_log(message, level="INFO"):
-            original_log(message, level)
-            on_log(f"[{level}] {message}")
+        def hooked_log(message, level="INFO", console=True):
+            original_log(message, level, console)
+            # console=False olan satirlar (dosya-basina ayrintilar) sadece
+            # log dosyasina yazilir, CLI/GUI canli akisina YANSITILMAZ.
+            if console:
+                on_log(f"[{level}] {message}")
         logger.log = hooked_log  # type: ignore
 
+    def stage(text: str) -> None:
+        if on_stage:
+            on_stage(text)
+
     hash_log_created = False  # HashLogWriter GERCEKTEN tamamlanip dosyayi kapattiginda True olur
+    report_data: dict = {}
 
     def result(success: bool, error: str = "", **extra) -> TransferResult:
+        finished_at = datetime.datetime.now().astimezone()
+        elapsed_seconds = round(time.monotonic() - run_started_clock, 2)
+        report_summary = {
+            "job_name": job.name,
+            "run_id": run_id,
+            "started_at": run_started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "report_file": str(report_html),
+            "run_info": {
+                "source": job.source_path,
+                "destination": job.destination_path,
+                "file_filter": job.file_filter,
+                "age_days": job.older_than_days,
+                "delete_after": job.delete_after_transfer,
+                "verify_mode": job.verification_mode,
+                "robocopy_mt": job.robocopy_threads,
+            },
+            "result": {
+                "success": success,
+                "error_message": error,
+                "robocopy_exit": extra.get("robocopy_exit"),
+                "total": extra.get("total_files", 0),
+                "verified": extra.get("verified_files", 0),
+                "failed": extra.get("failed_files", 0),
+                "missing": extra.get("missing_files", 0),
+                "skipped": extra.get("skipped_files", 0),
+                "transferred_bytes": extra.get("transferred_bytes", 0),
+                "duration": extra.get("duration", ""),
+                "elapsed_seconds": elapsed_seconds,
+            },
+            "log_files": {
+                "main_log": str(log_file),
+                "hash_log": str(hash_log_file) if hash_log_created else "",
+                "robocopy_log": str(robocopy_log),
+            },
+            "failed_files": [],
+            "missing_files": [],
+        }
+        if report_data:
+            report_summary.update(report_data)
+            report_summary["run_info"] = {**report_summary["run_info"], **report_data.get("run_info", {})}
+            report_summary["result"] = {**report_summary["result"], **report_data.get("result", {})}
+            report_summary["log_files"] = {**report_summary["log_files"], **report_data.get("log_files", {})}
+        report_summary["started_at"] = run_started_at.isoformat(timespec="seconds")
+        report_summary["finished_at"] = finished_at.isoformat(timespec="seconds")
+        report_summary["report_file"] = str(report_html)
+        report_summary["result"].update(
+            success=success, error_message=error, elapsed_seconds=elapsed_seconds,
+        )
+        summary_json.write_text(json.dumps(report_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        report_html.write_text(_render_html_report(report_summary), encoding="utf-8")
         return TransferResult(
             job_name=job.name, overall_success=success, error_message=error,
             log_file=str(log_file), robocopy_log=str(robocopy_log),
             hash_log_file=str(hash_log_file) if hash_log_created else "",
-            summary_json=str(summary_json), run_id=run_id, **extra,
+            summary_json=str(summary_json), report_file=str(report_html), run_id=run_id, **extra,
         )
 
     logger.header("=" * 64)
@@ -342,6 +722,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
     logger.info(f"Dogrulama : {job.verification_mode}  |  Robocopy /MT: {job.robocopy_threads}")
     logger.header("-" * 64)
 
+    stage("Baslatiliyor")
     smb_targets: list[str] = []
     job_lock = JobLock(lock_dir, job.name) if lock_dir else None
     try:
@@ -387,6 +768,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 return result(False, "Hedef olusturulamadi")
 
         # ---- Yas filtreli dosya listesi (hizli paralel tarama) ----
+        stage("Kaynak taraniyor")
         logger.header("-" * 64)
         logger.info(f"Dosya listesi taraniyor (>{job.older_than_days} gun)...")
         # Gece yarisi (00:00) hizali kesim - saniye-hassas hesap YERINE.
@@ -428,6 +810,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         logger.info(f"Transfer boyutu: {format_size(src_total_bytes)}")
 
         # ---- Disk kontrolu ----
+        stage("Disk kontrol ediliyor")
         proceed, _ = check_disk_and_alert(job.destination_path, src_total_bytes, job, logger)
         if not proceed:
             return result(False, "Disk kontrolu basarisiz")
@@ -438,18 +821,19 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         if job.verification_mode != "None":
             logger.header("-" * 64)
             mode_label = "boyut karsilastirmasi" if job.verification_mode == "SizeOnly" else "SHA256 hash (paralel)"
+            stage(f"Kaynak analizi ({mode_label})")
             logger.info(f"Kaynak analizi basliyor — {mode_label} ({len(src_files)} dosya)...")
             t0 = time.time()
 
             if job.verification_mode == "FullHash":
                 path_strs = [f.path for f in src_files]
-                hash_map = hash_files_parallel(path_strs)
+                hash_map = hash_files_parallel(path_strs, max_workers=job.robocopy_threads)
                 for f in src_files:
                     h = hash_map.get(f.path)
                     if h:
                         hash_table[f.rel_path.lower()] = SourceFileInfo(hash=h, size=f.size, src=f.path, rel=f.rel_path)
                     else:
-                        logger.warn(f"Hash alinamadi: {f.path}")
+                        logger.warn(f"Hash alinamadi: {f.path}", console=False)
             else:  # SizeOnly - boyut zaten tarama sirasinda alindi, ekstra islem gerekmez
                 for f in src_files:
                     hash_table[f.rel_path.lower()] = SourceFileInfo(hash=f"SIZE:{f.size}", size=f.size, src=f.path, rel=f.rel_path)
@@ -461,12 +845,14 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             logger.warn("VerificationMode=None: dogrulama atlanacak.")
 
         # ---- Robocopy ----
+        stage("Robocopy calisiyor")
         logger.header("-" * 64)
         logger.info(f"Robocopy basliyor (/MT:{job.robocopy_threads})...")
-        exit_code, duration = run_robocopy(
+        exit_code, duration = run_robocopy_with_progress(
             job.source_path, job.destination_path, job.file_filter,
             job.older_than_days, job.max_retries, job.robocopy_threads, str(robocopy_log),
-            cancel_event=cancel_event,
+            on_progress=on_progress, cancel_event=cancel_event, total_files=len(src_files),
+            on_log=lambda msg: logger.warn(msg, console=True),
         )
 
         if exit_code == -1:
@@ -480,12 +866,25 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         logger.log(f"Robocopy bitti. Exit={exit_code} ({' | '.join(desc)})  Sure={duration}", level)
 
         if robo_fatal:
-            logger.error(f"Robocopy FATAL hata - transfer hic calisamadi! Detay: {robocopy_log}")
+            # ONEMLI: ESKIDEN burada erken donup dogrulamayi TAMAMEN
+            # atliyorduk. Ancak /MT (coklu is parcacigi) ile calisirken,
+            # BAZI thread'ler dosyalari basariyla kopyalamisken BASKA bir
+            # thread'de ciddi bir hata olusup genel exit code'u FATAL (16)
+            # yapabiliyor - yani "hic dosya kopyalanmadi" aciklamasi
+            # coklu-thread senaryolarda HER ZAMAN dogru olmuyor. Erken
+            # donup hash log HIC uretmemek, kismen (belki cogunlukla)
+            # basarili olmus bir transferde kullaniciya HICBIR BILGI
+            # vermemek anlamina geliyordu - bu asil sikayet edilen sorundu.
+            #
+            # Simdi: FATAL durumu kaydedip/mail atip DOGRULAMAYA DEVAM
+            # ediyoruz. Dogrulama, hedefte GERCEKTE ne var ne yok tek tek
+            # tespit edip hash log uretecek. Is sonucu asla "tam basarili"
+            # RAPORLANMAZ (asagida job_ok zorla False yapiliyor), ama
+            # kullanici en azindan HANGI dosyalarin gectigini gorebilecek.
+            logger.error(f"Robocopy FATAL bildirdi (Exit={exit_code}) - dogrulama yine de yapilacak, hedefte gercekte ne oldugu tespit edilecek. Detay: {robocopy_log}")
             send_alert_mail(job.smtp_server, job.mail_from, job.mail_to,
                              f"[HATA] {job.name} - Robocopy FATAL Exit={exit_code}", f"Log: {robocopy_log}", logger)
-            return result(False, f"Robocopy FATAL hata exit={exit_code}")
-
-        if robo_had_file_errors:
+        elif robo_had_file_errors:
             # Bazi dosyalarda kopyalama hatasi olustu (ornegin kaynakta transfer
             # sirasinda yeni/degisen bir dosya, gecici paylasim ihlali gibi) ama
             # robocopy calismaya devam etti. Transferi TUMDEN basarisiz saymak
@@ -505,9 +904,13 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             verified_count = total
             failed_count = missing_count = 0
             transferred_bytes = src_total_bytes
-            job_ok = True
+            # FATAL bayragi varsa, dogrulama YAPILMADIGI icin (bu mod zaten
+            # dogrulama atliyor) gercekte ne kadarinin basarili oldugunu
+            # BILEMIYORUZ - guvenli tarafta kalip basarisiz raporlaniyor.
+            job_ok = not robo_fatal
         else:
             logger.header("-" * 64)
+            stage("Hedef taraniyor (dogrulama)")
             logger.info(f"Dogrulama basliyor — mod={job.verification_mode} ({len(hash_table)} dosya)...")
             t0 = time.time()
 
@@ -520,6 +923,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             )
             dst_index = build_rel_index(dst_scan.matched)
             logger.info(f"Hedef tarama tamam: {len(dst_index)} dosya bulundu.")
+            stage("Dogrulama yapiliyor")
 
             # HashLogWriter: her girdi HEMEN diske yazilir, bellekte TUM girdileri
             # tutan bir liste (eski hash_entries) ARTIK YOK. 400bin+ dosyada bu,
@@ -527,6 +931,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             # BAGIMSIZ (sabit) hale getirir.
             with HashLogWriter(hash_log_file, job.name, run_id, job.source_path,
                                 job.destination_path, job.verification_mode) as hlw:
+                # Basarisiz/eksik cikan dosyalarin hlw.add_entry() cagrisi
+                # BILEREK burada YAPILMAZ - asagidaki tekrar-deneme asamasi
+                # bitene kadar ERTELENIR, boylece hash logunda ayni dosya
+                # icin cift satir (once MISMATCH, sonra tekrar OK) OLUSMAZ;
+                # her dosya icin TEK ve NIHAI sonuc yazilir.
+                pending_negative: list[_PendingVerify] = []
                 if job.verification_mode == "FullHash":
                     dst_paths = []
                     rel_map = {}
@@ -536,11 +946,11 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                             dst_paths.append(dst_entry.path)
                             rel_map[dst_entry.path] = rel_key
                         else:
-                            logger.warn(f"EKSIK: {info.rel}")
+                            logger.warn(f"EKSIK: {info.rel}", console=False)
                             missing.append(info.rel)
-                            hlw.add_entry(info.rel, info.hash, "-", 0, "MISSING")
+                            pending_negative.append(_PendingVerify(info.rel, info.hash, "-", 0, "MISSING", None))
 
-                    dst_hash_map = hash_files_parallel(dst_paths) if dst_paths else {}
+                    dst_hash_map = hash_files_parallel(dst_paths, max_workers=job.robocopy_threads) if dst_paths else {}
 
                     for dst_path in dst_paths:
                         rel_key = rel_map[dst_path]
@@ -549,40 +959,70 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         sz = dst_index[rel_key].size  # taramadan geldi, ekstra stat() YOK
 
                         if dh is None:
-                            logger.error(f"HASH ALINAMADI: {info.rel}")
+                            logger.error(f"HASH ALINAMADI: {info.rel}", console=False)
                             failed.append(FailedFileInfo(rel=info.rel, src_hash=info.hash, dst_hash="(okunamadi)"))
-                            hlw.add_entry(info.rel, info.hash, "(okunamadi)", sz, "ERROR")
+                            pending_negative.append(_PendingVerify(info.rel, info.hash, "(okunamadi)", sz, "ERROR", dst_path))
                         elif dh == info.hash:
                             verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_path))
                             hlw.add_entry(info.rel, info.hash, dh, sz, "OK")
                         else:
-                            logger.error(f"HASH UYUMSUZ: {info.rel}  Kaynak={info.hash}  Hedef={dh}")
+                            logger.error(f"HASH UYUMSUZ: {info.rel}  Kaynak={info.hash}  Hedef={dh}", console=False)
                             failed.append(FailedFileInfo(rel=info.rel, src_hash=info.hash, dst_hash=dh))
-                            hlw.add_entry(info.rel, info.hash, dh, sz, "MISMATCH")
+                            pending_negative.append(_PendingVerify(info.rel, info.hash, dh, sz, "MISMATCH", dst_path))
                 else:  # SizeOnly - boyut karsilastirmasi tamamen bellek-ici, sifir ekstra I/O
                     for rel_key, info in hash_table.items():
                         dst_entry = dst_index.get(rel_key)
                         src_hash_label = f"(boyut:{format_size(info.size)})"
                         if dst_entry is None:
-                            logger.warn(f"EKSIK: {info.rel}")
+                            logger.warn(f"EKSIK: {info.rel}", console=False)
                             missing.append(info.rel)
-                            hlw.add_entry(info.rel, src_hash_label, "-", 0, "MISSING")
+                            pending_negative.append(_PendingVerify(info.rel, src_hash_label, "-", 0, "MISSING", None))
                             continue
                         sz = dst_entry.size
                         if sz == info.size:
                             verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_entry.path))
                             hlw.add_entry(info.rel, src_hash_label, f"(boyut:{format_size(sz)})", sz, "OK")
                         else:
-                            logger.error(f"BOYUT UYUMSUZ: {info.rel}  Kaynak={format_size(info.size)}  Hedef={format_size(sz)}")
+                            logger.error(f"BOYUT UYUMSUZ: {info.rel}  Kaynak={format_size(info.size)}  Hedef={format_size(sz)}", console=False)
                             failed.append(FailedFileInfo(rel=info.rel, src_hash=f"SIZE:{info.size}", dst_hash=f"SIZE:{sz}"))
-                            hlw.add_entry(info.rel, src_hash_label, f"(boyut:{format_size(sz)})", sz, "MISMATCH")
+                            pending_negative.append(_PendingVerify(info.rel, src_hash_label, f"(boyut:{format_size(sz)})", sz, "MISMATCH", dst_entry.path))
+
+                # ---- Basarisiz/eksik dosyalari tekrar dene ----
+                # Buyuk transferlerde (ornegin 200bin dosya) genellikle
+                # sadece BIRKAC dosya (gecici paylasim ihlali, kaynakta
+                # ayni anda degisen dosya vb.) basarisiz olur - bunlari
+                # otomatik olarak tekrar kopyalayip dogrulamak, TUM job'u
+                # "basarisiz + silinmedi" durumuna dusurmek yerine sadece
+                # gercekten sorunlu olanlari ayirt etmemizi saglar.
+                if pending_negative:
+                    stage("Hatali/eksik dosyalar tekrar deneniyor")
+                    logger.warn(f"{len(pending_negative)} dosya ilk denemede basarisiz/eksik cikti - kopyalama tekrar denenip yeniden dogrulanacak...")
+                    fixed, still_bad = _retry_and_reverify_files(job, hash_table, pending_negative, logger, cancel_event)
+                    fixed_rels = {f.rel for f in fixed}
+                    failed = [f for f in failed if f.rel not in fixed_rels]
+                    missing = [m for m in missing if m not in fixed_rels]
+                    for f in fixed:
+                        src_info = hash_table[f.rel.lower()]
+                        verified.append(VerifiedFileInfo(rel=f.rel, size=f.size, src_file=src_info.src, dst_file=f.dst_path))
+                        hlw.add_entry(f.rel, f.src_hash, f.dst_hash, f.size, "OK")
+                    for f in still_bad:
+                        hlw.add_entry(f.rel, f.src_hash, f.dst_hash, f.size, f.result)
+                    if fixed:
+                        logger.success(f"Tekrar deneme sonucu {len(fixed)} dosya duzeltildi ve dogrulandi - bu dosyalar da kaynaktan silinecek.")
+                    if still_bad:
+                        logger.error(f"Tekrar denemeye ragmen {len(still_bad)} dosya hala basarisiz/eksik kaldi - bu dosyalar kaynaktan SILINMEYECEK.")
 
                 total = hlw.total_entries
                 verified_count = hlw.ok_count
                 failed_count = hlw.mismatch_count + hlw.error_count
                 missing_count = hlw.missing_count
                 transferred_bytes = hlw.total_bytes
-                job_ok = hlw.finish(str(duration))
+                verification_ok = hlw.finish(str(duration))
+                # Robocopy FATAL bildirmisse, dogrulama TEK TEK her seyi
+                # gecerli bulsa bile is sonucu "tam basarili" RAPORLANMAZ -
+                # FATAL, ciddi bir sorunun isareti oldugu icin guvenli
+                # tarafta kaliniyor (kullanici log'da GERCEK detaylari gorur).
+                job_ok = verification_ok and not robo_fatal
             hash_log_created = True  # with blogu basariyla tamamlandi, dosya gercekten diskte
 
             logger.success(f"Hash logu yazildi: {hash_log_file}")
@@ -601,6 +1041,13 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
 
         if job_ok:
             logger.success("TUM DOSYALAR DOGRULANDI.")
+        elif robo_fatal and failed_count == 0 and missing_count == 0:
+            # Dogrulama TEK TEK her seyi gecerli buldu (0 basarisiz, 0 eksik)
+            # ama robocopy FATAL bildirdigi icin is yine de basarisiz
+            # raporlaniyor - bunu ayri ve NET bir sekilde belirtiyoruz,
+            # yoksa "DOGRULAMA HATASI" mesaji yaniltici olurdu (dogrulamanin
+            # KENDISI aslinda sorun bulmadi).
+            logger.error(f"Robocopy FATAL bildirdigi icin is BASARISIZ sayildi, ancak dogrulanan {verified_count} dosyanin hepsi TUTARLI cikti - kismi bir basari olabilir, log'u inceleyin.")
         else:
             logger.error(f"DOGRULAMA HATASI! Basarisiz={failed_count} Eksik={missing_count}")
             send_alert_mail(job.smtp_server, job.mail_from, job.mail_to,
@@ -608,27 +1055,76 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
 
         # ---- Silme ----
         if job.delete_after_transfer:
-            if job_ok:
-                logger.warn("Kaynak dosyalar siliniyor...")
-                del_err = 0
-                for v in verified:
-                    try:
-                        os.remove(v.src_file)
-                    except OSError as e:
-                        logger.error(f"Silinemedi: {v.src_file} — {e}")
-                        del_err += 1
-                if del_err == 0:
-                    logger.success("Tum kaynak dosyalar silindi.")
+            if job.verification_mode == "None":
+                # Dogrulama yapilmadigi icin dosya-bazli sonuc YOK - sadece
+                # robocopy'nin genel exit koduna guvenilebilir.
+                if job_ok:
+                    stage("Kaynak dosyalar siliniyor")
+                    logger.warn(f"Kaynak dosyalar siliniyor... ({len(src_files)} dosya, dogrulama atlandi)")
+                    src_paths = [f.path for f in src_files]
+                    del_ok, del_errors = delete_files_parallel(
+                        src_paths, max_workers=job.robocopy_threads,
+                        progress_callback=lambda done, tot: logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya"),
+                        cancel_event=cancel_event,
+                        max_retries=job.max_retries, logger=logger,
+                    )
+                    for p, err in del_errors:
+                        logger.error(f"Silinemedi: {p} — {err}", console=False)
+                    if not del_errors:
+                        logger.success(f"Tum kaynak dosyalar silindi ({del_ok} dosya).")
+                    else:
+                        logger.warn(f"{del_ok} dosya silindi, {len(del_errors)} dosya silinemedi.")
+                    dirs_removed, dir_errors = remove_empty_dirs(job.source_path)
+                    if dirs_removed:
+                        logger.info(f"Bos kalan {dirs_removed} kaynak klasoru de silindi.")
+                    for d, err in dir_errors:
+                        logger.warn(f"Bos klasor silinemedi: {d} — {err}", console=False)
                 else:
-                    logger.warn(f"{del_err} dosya silinemedi.")
+                    logger.warn("Dogrulama atlandi (VerificationMode=None) ve robocopy basarisiz raporladi — kaynak SILINMEDI.")
             else:
-                logger.warn("Dogrulama basarisiz — kaynak SILINMEDI.")
+                # Dosya-bazli dogrulama VAR: sadece TEK TEK dogrulanmis (ilk
+                # denemede ya da yukaridaki tekrar-deneme sonrasi) dosyalar
+                # kaynaktan silinir. Hala basarisiz/eksik kalanlar guvenlik
+                # icin kaynakta BIRAKILIR - is genel olarak "basarisiz"
+                # raporlansa bile (ornegin 200000 dosyadan sadece 2'si
+                # sorunluysa) dogrulanan 199998 dosya YINE DE silinir; bu
+                # durum asagida NET olarak loglanir.
+                if verified:
+                    stage("Kaynak dosyalar siliniyor")
+                    logger.warn(f"Kaynak dosyalar siliniyor... ({len(verified)} dogrulanmis dosya)")
+                    verified_paths = [v.src_file for v in verified]
+                    del_ok, del_errors = delete_files_parallel(
+                        verified_paths, max_workers=job.robocopy_threads,
+                        progress_callback=lambda done, tot: logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya"),
+                        cancel_event=cancel_event,
+                        max_retries=job.max_retries, logger=logger,
+                    )
+                    for p, err in del_errors:
+                        logger.error(f"Silinemedi: {p} — {err}", console=False)
+                    if not del_errors:
+                        logger.success(f"Dogrulanan {del_ok} kaynak dosya silindi.")
+                    else:
+                        logger.warn(f"{del_ok} dosya silindi, {len(del_errors)} dosya silinemedi (detay: log dosyasi).")
+                    dirs_removed, dir_errors = remove_empty_dirs(job.source_path)
+                    if dirs_removed:
+                        logger.info(f"Bos kalan {dirs_removed} kaynak klasoru de silindi.")
+                    for d, err in dir_errors:
+                        logger.warn(f"Bos klasor silinemedi: {d} — {err}", console=False)
+                else:
+                    logger.warn("Silinecek dogrulanmis dosya yok — kaynak SILINMEDI.")
 
-        # ---- JSON ozet ----
+                if failed or missing:
+                    logger.error(
+                        f"{len(failed) + len(missing)} dosya tekrar denemeye ragmen basarisiz/eksik kaldi — "
+                        f"BU DOSYALAR KAYNAKTA KORUNDU (silinmedi). Detaylar hash logunda: {hash_log_file}"
+                    )
+
+        # ---- JSON ve HTML rapor ozeti ----
         summary = {
             "job_name": job.name, "run_id": run_id,
             "run_info": {
                 "source": job.source_path, "destination": job.destination_path,
+            "file_filter": job.file_filter,
                 "age_days": job.older_than_days, "delete_after": job.delete_after_transfer,
                 "verify_mode": job.verification_mode, "robocopy_mt": job.robocopy_threads,
             },
@@ -646,14 +1142,25 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             "failed_files": [{"rel": f.rel, "src_hash": f.src_hash, "dst_hash": f.dst_hash} for f in failed],
             "missing_files": missing,
         }
-        summary_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
+        stage("Tamamlandi")
         logger.header("=" * 64)
         logger.log("JOB TAMAMLANDI — BASARILI" if job_ok else "JOB TAMAMLANDI — HATALAR VAR",
                     "SUCCESS" if job_ok else "ERROR")
 
+        final_error = ""
+        if not job_ok:
+            if robo_fatal and failed_count == 0 and missing_count == 0:
+                final_error = f"Robocopy FATAL bildirdi (Exit={exit_code}), ancak dogrulanan {verified_count} dosya tutarli"
+            elif robo_fatal:
+                final_error = f"Robocopy FATAL bildirdi (Exit={exit_code}) + dogrulamada Basarisiz={failed_count} Eksik={missing_count}"
+            else:
+                final_error = f"Dogrulama: Basarisiz={failed_count} Eksik={missing_count}"
+
+        summary["result"]["error_message"] = final_error
+        report_data.update(summary)
         return result(
-            job_ok, total_files=total, verified_files=verified_count,
+            job_ok, final_error, total_files=total, verified_files=verified_count,
             failed_files=failed_count, missing_files=missing_count,
             skipped_files=skipped, transferred_bytes=transferred_bytes,
             duration=str(duration),
@@ -663,7 +1170,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         if credential_store:
             for target in smb_targets:
                 credential_store.unregister_smb_session(target)
-                logger.info(f"SMB oturumu temizlendi: {target}")
+                logger.info(f"SMB oturumu temizlendi: {target}", console=False)
         if job_lock:
             job_lock.release()
         logger.close()  # EngineLogger artik dosya tanitcisini surekli acik tutuyor - burada kapatiliyor
