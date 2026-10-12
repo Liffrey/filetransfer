@@ -62,6 +62,7 @@ class TransferJob:
     last_message: Optional[str] = None
     last_log_file: Optional[str] = None
     last_hash_log: Optional[str] = None
+    last_report_file: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -294,6 +295,7 @@ class JobConfigStore:
         message: str,
         log_file: str = "",
         hash_log: str = "",
+        report_file: str = "",
     ) -> bool:
         """Arka plan calistirma sonrasi durum bilgisini gunceller (bos liste ile ezmeyi engeller)."""
         import datetime
@@ -309,6 +311,7 @@ class JobConfigStore:
                 j.last_message = message
                 j.last_log_file = log_file
                 j.last_hash_log = hash_log
+                j.last_report_file = report_file
                 found = True
         if not found:
             return False
@@ -347,6 +350,7 @@ def _normalize_keys(item: dict) -> dict:
         "LastMessage": "last_message",
         "LastLogFile": "last_log_file",
         "LastHashLog": "last_hash_log",
+        "LastReportFile": "last_report_file",
     }
     out = {}
     for k, v in item.items():

@@ -56,20 +56,22 @@ from gui.style import (
 from resources import get_app_icon_path
 
 
-COLUMNS = ["Job Adi", "Kaynak", "Hedef", "Yas(gun)", "Sil", "Aktif", "Zamanlama", "Son Calisma", "Durum", "Log", "Hash Log"]
+COLUMNS = ["Job Adi", "Kaynak", "Hedef", "Yas(gun)", "Sil", "Aktif", "Zamanlama", "Son Calisma", "Durum", "Rapor", "Log", "Hash Log"]
+REPORT_COL = COLUMNS.index("Rapor")
 LOG_COL = COLUMNS.index("Log")
 HASH_LOG_COL = COLUMNS.index("Hash Log")
 
 # "Hakkinda" penceresinde gosterilecek metin - burayi diledigin gibi duzenleyebilirsin.
 ABOUT_TEXT = """Transfer Console
 
-        SMB üzerinden dosya kopyalama amacıyla kullanılmaktadır.
+Dosya aktarimi, butunluk dogrulamasi ve raporlama araci
 
-        Version 1.17 
+Surum 1.18
+11 Ekim 2026
 
-        11-08-2026
-
-        Buğra
+Robocopy tabanli aktarim
+SHA-256 veya dosya boyutu ile dogrulama
+JSON ve HTML calisma raporlari
 """
 
 TASK_COLUMNS = ["Job", "Durum", "Asama", "Ilerleme", "Sure", ""]
@@ -126,6 +128,19 @@ class TransferWorker(QThread):
         self.cancel_event.set()
 
 
+class ScheduleDeleteWorker(QThread):
+    """Windows zamanlanmis gorev silme komutunu GUI thread'i disinda calistirir."""
+
+    result_ready = Signal(str, object)
+
+    def __init__(self, job_name: str, parent=None):
+        super().__init__(parent)
+        self.job_name = job_name
+
+    def run(self):
+        self.result_ready.emit(self.job_name, unregister_scheduled_task(self.job_name))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config_path: str, cred_dir: str, exe_path: str,
                  settings: Optional[QSettings] = None, initial_theme: str = THEME_LIGHT):
@@ -151,6 +166,7 @@ class MainWindow(QMainWindow):
         # ayrica run_transfer icindeki JobLock ile (surecler-arasi, ornegin
         # Gorev Zamanlayici ile cakisma icin) engellenir.
         self.workers: dict[str, TransferWorker] = {}
+        self.schedule_delete_workers: dict[str, ScheduleDeleteWorker] = {}
         # Her calisan/az once biten job icin CANLI durum - hem ana tablonun
         # Ilerleme sutununu hem de asagidaki ayri "Gorevler" panelini besler
         # (Veeam/vCenter tarzi gorev listesi - bkz. JobTaskState). Satirlar
@@ -254,6 +270,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(REPORT_COL, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(LOG_COL, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(HASH_LOG_COL, QHeaderView.ResizeMode.ResizeToContents)
         self.table.doubleClicked.connect(self._on_edit)
@@ -379,6 +396,7 @@ class MainWindow(QMainWindow):
                     item.setBackground(QColor(status_error_bg(self.theme)))
                 self.table.setItem(row, col, item)
 
+            self.table.setCellWidget(row, REPORT_COL, self._make_report_button(job.name, job.last_report_file))
             self.table.setCellWidget(row, LOG_COL, self._make_log_button(job.name, job.last_log_file))
             self.table.setCellWidget(row, HASH_LOG_COL, self._make_log_button(job.name, job.last_hash_log, hash_log=True))
         self.table.setSortingEnabled(True)
@@ -424,6 +442,15 @@ class MainWindow(QMainWindow):
         btn.setToolTip(log_path if exists else "Henuz olusturulmadi")
         handler = self._on_view_hash_log if hash_log else self._on_view_log
         btn.clicked.connect(partial(handler, job_name))
+        return btn
+
+    def _make_report_button(self, job_name: str, report_path: Optional[str]) -> QPushButton:
+        btn = QPushButton("Rapor")
+        btn.setStyleSheet("padding: 3px 10px;")
+        exists = bool(report_path) and os.path.exists(report_path)
+        btn.setEnabled(exists)
+        btn.setToolTip(report_path if exists else "Henuz rapor olusturulmadi")
+        btn.clicked.connect(partial(self._on_view_report, job_name))
         return btn
 
     def _update_run_stop_buttons(self) -> None:
@@ -600,6 +627,9 @@ class MainWindow(QMainWindow):
         if not job:
             QMessageBox.warning(self, "Uyari", "Once bir job secin.")
             return
+        if job.name in self.schedule_delete_workers:
+            self.status.showMessage(f"'{job.name}' silme islemi zaten devam ediyor.")
+            return
         if job.name in self.workers and self.workers[job.name].isRunning():
             QMessageBox.warning(self, "Uyari", f"'{job.name}' su an calisiyor, once durdurun.")
             return
@@ -609,9 +639,27 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        unregister_scheduled_task(job.name)
-        self.config_store.delete_job(job.name)
+
+        worker = ScheduleDeleteWorker(job.name, self)
+        self.schedule_delete_workers[job.name] = worker
+        worker.result_ready.connect(self._on_schedule_delete_finished)
+        worker.finished.connect(worker.deleteLater)
+        self.status.showMessage(f"'{job.name}' zamanlamasi kaldiriliyor...")
+        worker.start()
+
+    def _on_schedule_delete_finished(self, job_name: str, schedule_result) -> None:
+        self.schedule_delete_workers.pop(job_name, None)
+        if not self.config_store.delete_job(job_name):
+            QMessageBox.warning(self, "Hata", f"'{job_name}' config dosyasindan silinemedi.")
+            return
         self.refresh_grid()
+        if schedule_result.success:
+            self.status.showMessage(f"'{job_name}' ve zamanlamasi silindi.")
+        else:
+            self.status.showMessage(
+                f"'{job_name}' silindi ancak zamanlamasi kaldirilamadi: {schedule_result.message}",
+                10000,
+            )
 
     def _log_job(self, job_name: str, line: str, level_override: Optional[str] = None) -> None:
         """Bir job'a ait log satirini o job'un KENDI tamponunda saklar; ekranda
@@ -769,6 +817,7 @@ class MainWindow(QMainWindow):
         message = result.error_message or f"{result.verified_files} dosya dogrulandi"
         self.config_store.update_run_result(
             result.job_name, status_str, message, result.log_file, result.hash_log_file,
+            result.report_file,
         )
 
         # Gorevler panelindeki satir KALICI kalir - kullanici '✕' ile elle
@@ -802,6 +851,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Bilgi", "Henuz hash log bulunamadi.")
             return
         self._open_in_default_viewer(job.last_hash_log)
+
+    def _on_view_report(self, job_name: str) -> None:
+        job = self.config_store.get_job(job_name)
+        if not job or not job.last_report_file or not os.path.exists(job.last_report_file):
+            QMessageBox.information(self, "Bilgi", "Henuz rapor bulunamadi.")
+            return
+        self._open_in_default_viewer(job.last_report_file)
 
     def _open_in_default_viewer(self, path: str):
         if sys.platform == "win32":
@@ -897,9 +953,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         running = [w for w in self.workers.values() if w.isRunning()]
-        if running:
+        schedule_deletions = [w for w in self.schedule_delete_workers.values() if w.isRunning()]
+        if running or schedule_deletions:
+            message = f"{len(running)} job hala calisiyor."
+            if schedule_deletions:
+                message += f" {len(schedule_deletions)} gorev silme islemi devam ediyor."
             reply = QMessageBox.question(
-                self, "Cikis", f"{len(running)} job hala calisiyor. Yine de cikilsin mi?",
+                self, "Cikis", f"{message} Yine de cikilsin mi?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
@@ -913,7 +973,7 @@ class MainWindow(QMainWindow):
             # thread'ler GERCEKTEN bitene kadar (UI donmasin diye
             # processEvents ile) beklenir; makul surede bitmezlerse kapanis
             # IPTAL edilir (veri bozulmasi/crash riskini almaktansa).
-            still_running = list(running)
+            still_running = list(running) + schedule_deletions
             deadline = time.monotonic() + 30
             while still_running and time.monotonic() < deadline:
                 still_running = [w for w in still_running if not w.wait(200)]

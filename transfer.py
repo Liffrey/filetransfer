@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import html
 import hashlib
 import json
 import os
@@ -84,6 +85,7 @@ class TransferResult:
     robocopy_log: str = ""
     hash_log_file: str = ""
     summary_json: str = ""
+    report_file: str = ""
     run_id: str = ""
     total_files: int = 0
     verified_files: int = 0
@@ -128,6 +130,108 @@ def _robocopy_exit_description(code: int) -> list[str]:
     if code & 16:
         parts.append("FATAL HATA")
     return parts
+
+
+def _render_html_report(summary: dict) -> str:
+    """Calisma ozetini dis bagimliligi olmayan, tarayicida acilabilir HTML'e cevirir."""
+    run_info = summary.get("run_info", {})
+    result = summary.get("result", {})
+    successful = bool(result.get("success"))
+    cancelled = result.get("error_message") == "Kullanici tarafindan durduruldu"
+    status_text = "BASARILI" if successful else ("DURDURULDU" if cancelled else "HATALI")
+    status_color = "#18794e" if successful else ("#8a5a00" if cancelled else "#b42318")
+
+    def esc(value) -> str:
+        return html.escape(str(value if value not in (None, "") else "-"))
+
+    elapsed = float(result.get("elapsed_seconds") or 0)
+    transferred_bytes = int(result.get("transferred_bytes") or 0)
+    speed = f"{transferred_bytes / elapsed / 1024 / 1024:.2f} MB/sn" if elapsed > 0 else "-"
+    metrics = [
+        ("Toplam dosya", result.get("total", 0)),
+        ("Dogrulanan", result.get("verified", 0)),
+        ("Basarisiz", result.get("failed", 0)),
+        ("Eksik", result.get("missing", 0)),
+        ("Atlanan", result.get("skipped", 0)),
+        ("Aktarilan", format_size(transferred_bytes)),
+        ("Ortalama hiz", speed),
+        ("Toplam sure", f"{elapsed:.1f} sn"),
+    ]
+    metric_html = "".join(
+        f'<div class="metric"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>'
+        for label, value in metrics
+    )
+
+    def file_link(label: str, path: str) -> str:
+        if not path:
+            return ""
+        href = Path(path).resolve().as_uri()
+        return f'<a href="{esc(href)}">{esc(label)}</a>'
+
+    links = summary.get("log_files", {})
+    link_html = " · ".join(
+        link for label, key in (("Transfer logu", "main_log"), ("Robocopy logu", "robocopy_log"), ("Hash logu", "hash_log"))
+        if (link := file_link(label, links.get(key, "")))
+    ) or "Log dosyasi yok"
+
+    failed_files = summary.get("failed_files", [])
+    failed_rows = "".join(
+        f"<tr><td>{esc(item.get('rel'))}</td><td>{esc(item.get('src_hash'))}</td>"
+        f"<td>{esc(item.get('dst_hash'))}</td></tr>"
+        for item in failed_files[:500]
+    )
+    if len(failed_files) > 500:
+        failed_rows += f"<tr><td colspan=\"3\">Ilk 500 kayit gosteriliyor; tam liste hash/JSON raporunda ({len(failed_files)} dosya).</td></tr>"
+    missing_files = summary.get("missing_files", [])
+    missing_rows = "".join(
+        f"<tr><td>{esc(item.get('rel') if isinstance(item, dict) else item)}</td></tr>"
+        for item in missing_files[:500]
+    )
+    if len(missing_files) > 500:
+        missing_rows += f"<tr><td>Ilk 500 kayit gosteriliyor; tam liste JSON raporunda ({len(missing_files)} dosya).</td></tr>"
+    error_message = result.get("error_message", "")
+    error_html = f'<p class="error">{esc(error_message)}</p>' if error_message else ""
+
+    return f"""<!doctype html>
+<html lang="tr">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(summary.get('job_name'))} - Transfer raporu</title>
+<style>
+body {{ margin: 0; background: #f3f5f7; color: #17212b; font: 15px/1.5 "Segoe UI", sans-serif; }}
+main {{ max-width: 1080px; margin: 32px auto; padding: 0 20px; }}
+header {{ display: flex; justify-content: space-between; align-items: start; gap: 20px; border-bottom: 1px solid #d7dee5; padding-bottom: 18px; }}
+h1 {{ margin: 0; font-size: 26px; }} h2 {{ margin: 28px 0 10px; font-size: 18px; }}
+.status {{ color: {status_color}; border: 1px solid currentColor; padding: 4px 10px; font-weight: 700; }}
+.muted {{ color: #536273; }} .error {{ padding: 10px 12px; color: #8f1d16; background: #fdecea; }}
+.metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: #d7dee5; border: 1px solid #d7dee5; }}
+.metric {{ background: white; padding: 12px 14px; }} .metric span {{ display: block; color: #536273; font-size: 13px; }}
+.metric strong {{ display: block; margin-top: 4px; font-size: 18px; overflow-wrap: anywhere; }}
+table {{ width: 100%; border-collapse: collapse; background: white; }} th, td {{ padding: 9px 10px; text-align: left; border-bottom: 1px solid #e1e6eb; overflow-wrap: anywhere; }}
+th {{ background: #e9eef2; }} .details {{ display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 6px 14px; }}
+.details strong {{ overflow-wrap: anywhere; }} a {{ color: #075e9c; }}
+@media (max-width: 600px) {{ main {{ margin: 18px auto; }} header {{ display: block; }} .status {{ display: inline-block; margin-top: 12px; }} .details {{ grid-template-columns: 1fr; gap: 0; }} }}
+</style>
+<main>
+<header><div><h1>{esc(summary.get('job_name'))}</h1><div class="muted">Run ID: {esc(summary.get('run_id'))}</div></div><span class="status">{status_text}</span></header>
+{error_html}
+<h2>Ozet</h2><section class="metrics">{metric_html}</section>
+<h2>Calisma bilgileri</h2><div class="details">
+<span>Baslangic</span><strong>{esc(summary.get('started_at'))}</strong>
+<span>Bitis</span><strong>{esc(summary.get('finished_at'))}</strong>
+<span>Kaynak</span><strong>{esc(run_info.get('source'))}</strong>
+<span>Hedef</span><strong>{esc(run_info.get('destination'))}</strong>
+<span>Dosya filtresi</span><strong>{esc(run_info.get('file_filter'))}</strong>
+<span>Yas siniri</span><strong>{esc(run_info.get('age_days'))} gun</strong>
+<span>Dogrulama</span><strong>{esc(run_info.get('verify_mode'))}</strong>
+<span>Transfer sonrasi sil</span><strong>{esc(run_info.get('delete_after'))}</strong>
+<span>Robocopy cikis kodu</span><strong>{esc(result.get('robocopy_exit'))}</strong>
+<span>Robocopy suresi</span><strong>{esc(result.get('duration'))}</strong>
+</div>
+<h2>Basarisiz dosyalar</h2><table><thead><tr><th>Dosya</th><th>Kaynak hash</th><th>Hedef sonucu</th></tr></thead><tbody>{failed_rows or '<tr><td colspan="3">Basarisiz dosya yok</td></tr>'}</tbody></table>
+<h2>Eksik dosyalar</h2><table><thead><tr><th>Dosya</th></tr></thead><tbody>{missing_rows or '<tr><td>Eksik dosya yok</td></tr>'}</tbody></table>
+<h2>Loglar</h2><p>{link_html}</p>
+</main></html>"""
 
 
 def send_alert_mail(smtp_server: str, mail_from: str, mail_to: list[str],
@@ -523,11 +627,14 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
     safe_name = sanitize_filename(job.name)
     log_dir = Path(job.log_dir or "C:\\TransferLogs")
     log_dir.mkdir(parents=True, exist_ok=True)
+    run_started_at = datetime.datetime.now().astimezone()
+    run_started_clock = time.monotonic()
 
     log_file = log_dir / f"Transfer_{safe_name}_{run_id}.log"
     robocopy_log = log_dir / f"Robocopy_{safe_name}_{run_id}.log"
     hash_log_file = log_dir / f"HashLog_{safe_name}_{run_id}.log"
     summary_json = log_dir / f"Summary_{safe_name}_{run_id}.json"
+    report_html = log_dir / f"Report_{safe_name}_{run_id}.html"
 
     logger = EngineLogger(log_file)
     if on_log:
@@ -545,13 +652,65 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             on_stage(text)
 
     hash_log_created = False  # HashLogWriter GERCEKTEN tamamlanip dosyayi kapattiginda True olur
+    report_data: dict = {}
 
     def result(success: bool, error: str = "", **extra) -> TransferResult:
+        finished_at = datetime.datetime.now().astimezone()
+        elapsed_seconds = round(time.monotonic() - run_started_clock, 2)
+        report_summary = {
+            "job_name": job.name,
+            "run_id": run_id,
+            "started_at": run_started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "report_file": str(report_html),
+            "run_info": {
+                "source": job.source_path,
+                "destination": job.destination_path,
+                "file_filter": job.file_filter,
+                "age_days": job.older_than_days,
+                "delete_after": job.delete_after_transfer,
+                "verify_mode": job.verification_mode,
+                "robocopy_mt": job.robocopy_threads,
+            },
+            "result": {
+                "success": success,
+                "error_message": error,
+                "robocopy_exit": extra.get("robocopy_exit"),
+                "total": extra.get("total_files", 0),
+                "verified": extra.get("verified_files", 0),
+                "failed": extra.get("failed_files", 0),
+                "missing": extra.get("missing_files", 0),
+                "skipped": extra.get("skipped_files", 0),
+                "transferred_bytes": extra.get("transferred_bytes", 0),
+                "duration": extra.get("duration", ""),
+                "elapsed_seconds": elapsed_seconds,
+            },
+            "log_files": {
+                "main_log": str(log_file),
+                "hash_log": str(hash_log_file) if hash_log_created else "",
+                "robocopy_log": str(robocopy_log),
+            },
+            "failed_files": [],
+            "missing_files": [],
+        }
+        if report_data:
+            report_summary.update(report_data)
+            report_summary["run_info"] = {**report_summary["run_info"], **report_data.get("run_info", {})}
+            report_summary["result"] = {**report_summary["result"], **report_data.get("result", {})}
+            report_summary["log_files"] = {**report_summary["log_files"], **report_data.get("log_files", {})}
+        report_summary["started_at"] = run_started_at.isoformat(timespec="seconds")
+        report_summary["finished_at"] = finished_at.isoformat(timespec="seconds")
+        report_summary["report_file"] = str(report_html)
+        report_summary["result"].update(
+            success=success, error_message=error, elapsed_seconds=elapsed_seconds,
+        )
+        summary_json.write_text(json.dumps(report_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        report_html.write_text(_render_html_report(report_summary), encoding="utf-8")
         return TransferResult(
             job_name=job.name, overall_success=success, error_message=error,
             log_file=str(log_file), robocopy_log=str(robocopy_log),
             hash_log_file=str(hash_log_file) if hash_log_created else "",
-            summary_json=str(summary_json), run_id=run_id, **extra,
+            summary_json=str(summary_json), report_file=str(report_html), run_id=run_id, **extra,
         )
 
     logger.header("=" * 64)
@@ -960,11 +1119,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         f"BU DOSYALAR KAYNAKTA KORUNDU (silinmedi). Detaylar hash logunda: {hash_log_file}"
                     )
 
-        # ---- JSON ozet ----
+        # ---- JSON ve HTML rapor ozeti ----
         summary = {
             "job_name": job.name, "run_id": run_id,
             "run_info": {
                 "source": job.source_path, "destination": job.destination_path,
+            "file_filter": job.file_filter,
                 "age_days": job.older_than_days, "delete_after": job.delete_after_transfer,
                 "verify_mode": job.verification_mode, "robocopy_mt": job.robocopy_threads,
             },
@@ -982,7 +1142,6 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             "failed_files": [{"rel": f.rel, "src_hash": f.src_hash, "dst_hash": f.dst_hash} for f in failed],
             "missing_files": missing,
         }
-        summary_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
         stage("Tamamlandi")
         logger.header("=" * 64)
@@ -998,6 +1157,8 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             else:
                 final_error = f"Dogrulama: Basarisiz={failed_count} Eksik={missing_count}"
 
+        summary["result"]["error_message"] = final_error
+        report_data.update(summary)
         return result(
             job_ok, final_error, total_files=total, verified_files=verified_count,
             failed_files=failed_count, missing_files=missing_count,

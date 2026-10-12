@@ -75,7 +75,7 @@ def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
     status = "Basarili" if result.overall_success else "Hatali"
     message = result.error_message or f"{result.verified_files} dosya dogrulandi"
     ok = config_store.update_run_result(
-        job_name, status, message, result.log_file, result.hash_log_file,
+        job_name, status, message, result.log_file, result.hash_log_file, result.report_file,
     )
     if not ok:
         print("UYARI: Job durumu config'e yazilamadi (guvenlik engeli veya IO hatasi).", file=sys.stderr)

@@ -6,6 +6,7 @@ File Transfer Console is a PySide6-based Windows file transfer utility that prov
 
 - GUI and CLI execution modes
 - Run multiple transfer jobs concurrently from the GUI, tracked in a live "Gorevler" (Tasks) panel showing each job's stage, progress and duration, plus per-row Log/Hash Log buttons in the main grid and a separate live log view per job
+- Per-run JSON summaries and self-contained HTML reports with timing, throughput, verification counts, failed/missing files, and links to logs; the latest report is available from each job row
 - Windows Task Scheduler integration, including scheduling jobs that run as a non-SYSTEM account
 - Robocopy-based transfer engine
 - Hash (SHA256) or size-only verification with detailed step-by-step output written to the log file while the console/GUI log view stays high-level

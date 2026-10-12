@@ -435,4 +435,5 @@ class JobEditorDialog(QDialog):
             job.last_message = self.existing_job.last_message
             job.last_log_file = self.existing_job.last_log_file
             job.last_hash_log = self.existing_job.last_hash_log
+            job.last_report_file = self.existing_job.last_report_file
         return job
