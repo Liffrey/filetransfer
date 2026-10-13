@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QScrollArea, QWidget,
     QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox, QPushButton,
     QMessageBox, QGroupBox, QDialogButtonBox, QInputDialog,
+    QLabel,
 )
 
 from engine.config import TransferJob
@@ -98,11 +99,17 @@ class JobEditorDialog(QDialog):
         form.addRow("Oncelik:", self.priority_spin)
 
         self.delete_policy_combo = QComboBox()
-        self.delete_policy_combo.addItem("verified_only", "verified_only")
-        self.delete_policy_combo.addItem("never", "never")
-        self.delete_policy_combo.addItem("always (engellenir)", "always")
-        self.delete_policy_combo.setToolTip("Kaynak silme yalnizca dosya-bazli dogrulamadan sonra desteklenir. 'always' eski kayitlar icin engellenmistir.")
+        self.delete_policy_combo.addItem("Dogrulanan dosyalari sil (onerilen)", "verified_only")
+        self.delete_policy_combo.addItem("Kaynak dosyalara dokunma", "never")
+        self.delete_policy_combo.addItem("Tum adaylari dogrulamadan sil (engelli)", "always")
+        self.delete_policy_combo.setToolTip("Kaynak silme politikasi. Yalniz dogrulanmis dosyalar silinebilir.")
         form.addRow("Silme Politikasi:", self.delete_policy_combo)
+
+        self.delete_policy_help = QLabel()
+        self.delete_policy_help.setWordWrap(True)
+        form.addRow("", self.delete_policy_help)
+        self.delete_policy_combo.currentIndexChanged.connect(self._update_delete_policy_help)
+        self._update_delete_policy_help()
 
         self.require_preview_delete_check = QCheckBox("Silme oncesi onizleme zorunlu")
         self.require_preview_delete_check.setChecked(True)
@@ -252,6 +259,15 @@ class JobEditorDialog(QDialog):
         else:
             self.cred_combo.setCurrentText(current)
 
+    def _update_delete_policy_help(self):
+        policy = self.delete_policy_combo.currentData()
+        explanations = {
+            "verified_only": "Hedefte dosya-bazli doğrulamadan geçenler silinir. Güncel önizleme gerekir; başarısız veya eksik dosyalar kaynakta kalır.",
+            "never": "Aktarım ve doğrulama başarılı olsa bile kaynak dosyalar silinmez.",
+            "always": "Doğrulama sonucundan bağımsız tüm adayları silmek anlamına gelir. Veri kaybı riski nedeniyle desteklenmez: kaynak silme açıkken kaydetme reddedilir; eski ayarlarda da motor silmeyi engeller.",
+        }
+        self.delete_policy_help.setText(explanations.get(policy, "Bilinmeyen politika: kaynak silme engellenir."))
+
     def _on_new_credential(self):
         alias, ok = QInputDialog.getText(self, "Yeni Kimlik", "Alias adi (ornek: BackupServer01):")
         if not ok or not alias.strip():
@@ -336,7 +352,9 @@ class JobEditorDialog(QDialog):
         if self.delete_check.isChecked() and self.delete_policy_combo.currentData() == "always":
             QMessageBox.warning(
                 self, "Silme Politikasi",
-                "'always' guvenli degil ve desteklenmiyor. 'verified_only' veya 'never' secin.",
+                "'always', dosyalar hedefte doğrulansa da doğrulanmasa da kaynak adaylarını silmek demektir. "
+                "Bu davranış veri kaybı riski nedeniyle desteklenmiyor. 'Dogrulanan dosyalari sil' "
+                "veya 'Kaynak dosyalara dokunma' seçin.",
             )
             return
         if not self.is_edit and name.lower() in {n.lower() for n in self.existing_names}:

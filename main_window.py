@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QSplitter, QPlainTextEdit, QMessageBox,
     QStatusBar, QHeaderView, QFrame, QLabel, QProgressBar, QInputDialog, QLineEdit,
-    QDialog,
+    QDialog, QMenu, QToolButton,
 )
 
 from engine.config import JobConfigStore, TransferJob, DEFAULT_LOG_DIR, order_queued_jobs, sort_jobs_for_queue
@@ -233,7 +233,12 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
 
-        # Arac cubugu - mantiksal gruplar halinde, ayirici cizgilerle
+        toolbar_container = QWidget()
+        toolbar_layout = QVBoxLayout(toolbar_container)
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(4)
+
+        # Ana job ve transfer islemleri ilk satirda, yardimci araclar ikinci satirda.
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
 
@@ -244,51 +249,65 @@ class MainWindow(QMainWindow):
 
         self.btn_run = QPushButton("▶ Kuyruga Ekle")
         self.btn_run.setProperty("primary", True)
+        self.btn_run.setToolTip("Seçili işi önceliğine göre kuyruğa ekler. En fazla iki iş aynı anda çalışır.")
         self.btn_dry_run = QPushButton("Onizleme")
-        self.btn_dry_run.setToolTip("Secili job'u dosya kopyalamadan dry-run olarak calistirir.")
-        self.btn_resume = QPushButton("Devam Et (/Z)")
-        self.btn_resume.setToolTip("Secili job'u Robocopy restartable modunda calistirir.")
+        self.btn_dry_run.setToolTip("Seçili işi kopyalama ve silme yapmadan önizler.")
+        self.btn_resume = QPushButton("Devam Et")
+        self.btn_resume.setToolTip("Uyumlu checkpoint'i yükler; Robocopy /Z ile devam eder ve dosyaları yeniden doğrular.")
         self.btn_priority = QPushButton("Oncelik")
+        self.btn_priority.setToolTip("Kuyruk sırasını etkiler; eşit öncelikte eklenme sırası korunur.")
         self.btn_stop = QPushButton("■ Durdur")
         self.btn_stop.setProperty("danger", True)
         self.btn_stop.setEnabled(False)
-
-        self.btn_schedule = QPushButton("Zamanla")
-        self.btn_unschedule = QPushButton("Zamanlamayi Kaldir")
+        for button in (
+            self.btn_new, self.btn_edit, self.btn_delete, self.btn_run,
+            self.btn_dry_run, self.btn_resume, self.btn_stop, self.btn_priority,
+        ):
+            button.setProperty("compact", True)
 
         self.btn_theme = QPushButton()
         self.btn_theme.setCheckable(True)
 
-        self.btn_cred = QPushButton("Kimlik Yoneticisi")
         self.btn_refresh = QPushButton("⟳ Yenile")
-        self.btn_open_config = QPushButton("Config Ac")
-        self.btn_open_logs_folder = QPushButton("Log Klasoru")
-        self.btn_about = QPushButton("Hakkinda")
+        self.btn_tools = QToolButton()
+        self.btn_tools.setText("Araçlar")
+        self.btn_tools.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.tools_menu = QMenu(self.btn_tools)
+        self.tools_menu.addAction("Zamanla", self._on_schedule)
+        self.tools_menu.addAction("Zamanlamayi Kaldir", self._on_unschedule)
+        self.tools_menu.addSeparator()
+        self.tools_menu.addAction("Kimlik Yoneticisi", self._on_cred_manager)
+        self.tools_menu.addAction("Config Dosyasini Ac", self._on_open_config)
+        self.tools_menu.addAction("Log Klasorunu Ac", self._on_open_logs_folder)
+        self.tools_menu.addAction("Hakkinda", self._on_about)
+        self.btn_tools.setMenu(self.tools_menu)
+        self.btn_tools.setToolTip("Zamanlama, kimlik bilgileri ve dosya araçları")
 
-        def add_separator():
+        def add_separator(layout: QHBoxLayout):
             line = QFrame()
             line.setFrameShape(QFrame.Shape.VLine)
             line.setFrameShadow(QFrame.Shadow.Sunken)
-            toolbar.addWidget(line)
+            layout.addWidget(line)
 
         for b in (self.btn_new, self.btn_edit, self.btn_delete):
             toolbar.addWidget(b)
-        add_separator()
+        add_separator(toolbar)
         for b in (self.btn_run, self.btn_dry_run, self.btn_resume, self.btn_stop, self.btn_priority):
-            toolbar.addWidget(b)
-        add_separator()
-        for b in (self.btn_schedule, self.btn_unschedule):
-            toolbar.addWidget(b)
-        add_separator()
-        for b in (self.btn_cred, self.btn_refresh, self.btn_open_config, self.btn_open_logs_folder):
-            toolbar.addWidget(b)
-        add_separator()
-        toolbar.addWidget(self.btn_about)
-
-        toolbar.addWidget(self.btn_theme)
-
+            if b is not self.btn_priority:
+                toolbar.addWidget(b)
         toolbar.addStretch(1)
-        outer.addLayout(toolbar)
+
+        utility_toolbar = QHBoxLayout()
+        utility_toolbar.setSpacing(6)
+        utility_toolbar.addWidget(self.btn_priority)
+        utility_toolbar.addWidget(self.btn_refresh)
+        utility_toolbar.addWidget(self.btn_tools)
+        utility_toolbar.addWidget(self.btn_theme)
+        utility_toolbar.addStretch(1)
+
+        toolbar_layout.addLayout(toolbar)
+        toolbar_layout.addLayout(utility_toolbar)
+        outer.addWidget(toolbar_container)
 
         # Splitter: ust=grid, alt=log
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -384,13 +403,7 @@ class MainWindow(QMainWindow):
         self.btn_resume.clicked.connect(lambda: self._on_run("resume"))
         self.btn_priority.clicked.connect(self._on_set_priority)
         self.btn_stop.clicked.connect(self._on_stop)
-        self.btn_schedule.clicked.connect(self._on_schedule)
-        self.btn_unschedule.clicked.connect(self._on_unschedule)
-        self.btn_cred.clicked.connect(self._on_cred_manager)
         self.btn_refresh.clicked.connect(self.refresh_grid)
-        self.btn_open_config.clicked.connect(self._on_open_config)
-        self.btn_open_logs_folder.clicked.connect(self._on_open_logs_folder)
-        self.btn_about.clicked.connect(self._on_about)
         self.btn_theme.toggled.connect(self._on_theme_toggled)
 
         self._apply_theme(self.theme, persist=False)

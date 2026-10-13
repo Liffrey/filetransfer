@@ -235,6 +235,9 @@ QPushButton {{
     padding: 6px 14px;
     color: {tokens['button_text']};
 }}
+QPushButton[compact="true"] {{
+    padding: 4px 8px;
+}}
 QPushButton:hover {{
     background-color: {tokens['button_hover_bg']};
     border-color: {ACCENT};

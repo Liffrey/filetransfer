@@ -9,6 +9,8 @@ from PySide6.QtWidgets import QApplication
 
 from checkpoint import CheckpointJournal, checkpoint_signature
 from config import TransferJob, sort_jobs_for_queue
+from credentials import CredentialStore
+from gui.job_editor import JobEditorDialog
 from main_window import MainWindow, compute_task_progress
 from robocopy_runner import _build_robocopy_args
 import transfer as transfer_module
@@ -49,6 +51,18 @@ def test_deletion_guard_fails_closed():
         name="demo", delete_after_transfer=True, verification_mode="None"), True)[0]
     assert not _deletion_guard(TransferJob(
         name="demo", delete_after_transfer=True, verification_mode="unknown"), True)[0]
+
+
+def test_always_delete_policy_explains_data_loss_risk(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    dialog = JobEditorDialog(CredentialStore(str(tmp_path / "credentials")))
+
+    dialog.delete_policy_combo.setCurrentIndex(dialog.delete_policy_combo.findData("always"))
+
+    assert "Veri kaybı riski" in dialog.delete_policy_help.text()
+    assert "desteklenmez" in dialog.delete_policy_help.text()
+    dialog.close()
+    del app
 
 
 def test_expired_preview_receipt_cannot_authorize_deletion(tmp_path):
