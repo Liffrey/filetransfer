@@ -68,6 +68,43 @@ class RobocopyProgress:
 ProgressCallback = Callable[[RobocopyProgress], None]
 
 
+def _terminate_process_tree(proc) -> None:
+    """Windows'ta robocopy altindaki tum islem agacini temiz kapatir."""
+    if proc is None:
+        return
+
+    try:
+        if getattr(proc, "pid", None):
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            return
+    except Exception:
+        pass
+
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _reader_thread(pipe, line_queue: "deque[str]", stop_flag: list) -> None:
     """Popen.stdout'tan satir satir okuyup paylasilan kuyruga ekler.
     Ayri thread'de calisir ki ana dongu readline()'da bloke olmadan
@@ -156,6 +193,9 @@ def run_robocopy_with_progress(
     current_file = ""
     was_cancelled = False
     files_seen = 0  # su ana kadar goruntlenen "yeni dosya" satiri sayisi
+    last_ui_emit = 0.0
+    last_reported_files_done = -1
+    last_reported_percent = -1.0
 
     # Robocopy'nin KENDI /R+/W tekrar-deneme mekanizmasini canli takip etmek
     # icin: bir ERROR satiri gorulunce hangi islem/dosyanin basarisiz oldugu
@@ -185,8 +225,23 @@ def run_robocopy_with_progress(
     def emit_progress(percent: float) -> None:
         if on_progress is None:
             return
-        files_done = max(0, files_seen - 1)
-        percent_overall = round(files_done / total_files * 100, 1) if total_files else 0.0
+        nonlocal last_ui_emit, last_reported_files_done, last_reported_percent
+        files_done = min(files_seen, total_files) if total_files else 0
+        percent_overall = round((files_done / total_files) * 100, 1) if total_files else 0.0
+        now = time.monotonic()
+        min_files_delta = 1 if total_files <= 0 else max(1, total_files // 2000)
+        if (
+            total_files > 0
+            and files_done == last_reported_files_done
+            and abs(percent_overall - last_reported_percent) < 0.5
+            and (now - last_ui_emit) < 0.2
+        ):
+            return
+        if total_files > 0 and abs(files_done - last_reported_files_done) < min_files_delta and (now - last_ui_emit) < 0.2:
+            return
+        last_ui_emit = now
+        last_reported_files_done = files_done
+        last_reported_percent = percent_overall
         try:
             on_progress(RobocopyProgress(
                 current_file=current_file, percent=percent,
@@ -204,11 +259,7 @@ def run_robocopy_with_progress(
             if cancel_event is not None and cancel_event.is_set():
                 was_cancelled = True
                 stop_flag[0] = True
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                _terminate_process_tree(proc)
                 break
 
             if not line_queue:

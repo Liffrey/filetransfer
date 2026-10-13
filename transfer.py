@@ -1047,11 +1047,28 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             # raporlaniyor - bunu ayri ve NET bir sekilde belirtiyoruz,
             # yoksa "DOGRULAMA HATASI" mesaji yaniltici olurdu (dogrulamanin
             # KENDISI aslinda sorun bulmadi).
-            logger.error(f"Robocopy FATAL bildirdigi icin is BASARISIZ sayildi, ancak dogrulanan {verified_count} dosyanin hepsi TUTARLI cikti - kismi bir basari olabilir, log'u inceleyin.")
+            logger.error(f"Robocopy FATAL bildirdigi icin is BASARISIZ sayildi, ancak dogrulanan {verified_count} dosya tutarli cikti - kismi bir basari olabilir, log'u inceleyin.")
         else:
             logger.error(f"DOGRULAMA HATASI! Basarisiz={failed_count} Eksik={missing_count}")
             send_alert_mail(job.smtp_server, job.mail_from, job.mail_to,
                              f"[HATA] {job.name} - Dogrulama", f"Basarisiz={failed_count} Eksik={missing_count}", logger)
+
+        def emit_delete_progress(done: int, total: int, current_file: str = "") -> None:
+            if on_progress is None:
+                return
+            if total <= 0:
+                return
+            percent = round((done / total) * 100, 1)
+            try:
+                on_progress(RobocopyProgress(
+                    current_file=current_file or "Siliniyor...",
+                    percent=percent,
+                    files_done=min(done, total),
+                    files_total=total,
+                    percent_overall=percent,
+                ))
+            except Exception:
+                pass
 
         # ---- Silme ----
         if job.delete_after_transfer:
@@ -1062,9 +1079,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                     stage("Kaynak dosyalar siliniyor")
                     logger.warn(f"Kaynak dosyalar siliniyor... ({len(src_files)} dosya, dogrulama atlandi)")
                     src_paths = [f.path for f in src_files]
+                    def on_delete_progress(done, tot):
+                        emit_delete_progress(done, tot, "Kaynak dosyalar siliniyor")
+                        logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya")
                     del_ok, del_errors = delete_files_parallel(
                         src_paths, max_workers=job.robocopy_threads,
-                        progress_callback=lambda done, tot: logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya"),
+                        progress_callback=on_delete_progress,
                         cancel_event=cancel_event,
                         max_retries=job.max_retries, logger=logger,
                     )
@@ -1093,9 +1113,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                     stage("Kaynak dosyalar siliniyor")
                     logger.warn(f"Kaynak dosyalar siliniyor... ({len(verified)} dogrulanmis dosya)")
                     verified_paths = [v.src_file for v in verified]
+                    def on_delete_progress(done, tot):
+                        emit_delete_progress(done, tot, "Kaynak dosyalar siliniyor")
+                        logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya")
                     del_ok, del_errors = delete_files_parallel(
                         verified_paths, max_workers=job.robocopy_threads,
-                        progress_callback=lambda done, tot: logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya"),
+                        progress_callback=on_delete_progress,
                         cancel_event=cancel_event,
                         max_retries=job.max_retries, logger=logger,
                     )

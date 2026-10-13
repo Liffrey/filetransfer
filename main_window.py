@@ -66,8 +66,8 @@ ABOUT_TEXT = """Transfer Console
 
 Dosya aktarimi, butunluk dogrulamasi ve raporlama araci
 
-Surum 1.18
-11 Ekim 2026
+Surum 1.19
+14 Ekim 2026
 
 Robocopy tabanli aktarim
 SHA-256 veya dosya boyutu ile dogrulama
@@ -92,6 +92,34 @@ class JobTaskState:
     status: str = "running"
     start_time: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
+
+
+def _format_eta(seconds: float) -> str:
+    """Kalan sureyi yogun UI guncellemelerine meydan vermeden kisa formatta dondurur."""
+    total = max(0, int(seconds))
+    if total <= 0:
+        return "< 1 sn"
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}dk"
+    if minutes > 0:
+        return f"{minutes}dk {secs:02d}s"
+    return f"{secs}s"
+
+
+def compute_task_progress(files_done: int, files_total: int, elapsed_seconds: float = 0.0) -> tuple[int, str]:
+    """Calisma ilerlemesini % ve okunakli 'X/Y dosya (p%) ~ETA' metnini donusturur."""
+    done = min(max(0, int(files_done)), max(0, int(files_total))) if files_total else max(0, int(files_done))
+    total = max(0, int(files_total))
+    if total <= 0:
+        return 0, "0%"
+    percent = min(100, max(0, round((done / total) * 100)))
+    label = f"{done}/{total} dosya ({percent}%)"
+    if elapsed_seconds > 0 and done > 0 and done < total:
+        eta = elapsed_seconds * (total - done) / done
+        label += f" • ~{_format_eta(eta)} kaldı"
+    return percent, label
 
 
 class TransferWorker(QThread):
@@ -187,6 +215,7 @@ class MainWindow(QMainWindow):
         self._task_timer = QTimer(self)
         self._task_timer.setInterval(1000)
         self._task_timer.timeout.connect(self._tick_task_durations)
+        self._last_progress_emit_ts: dict[str, float] = {}
 
     # ------------------------------------------------------------------ UI
 
@@ -534,9 +563,10 @@ class MainWindow(QMainWindow):
 
         bar = self.tasks_table.cellWidget(row, TASK_PROGRESS_COL)
         if isinstance(bar, QProgressBar):
-            percent = round(t.files_done / t.files_total * 100) if t.files_total else 0
-            bar.setValue(min(100, percent))
-            bar.setFormat(f"{t.files_done}/{t.files_total} (%p)" if t.files_total else "%p%")
+            elapsed = max(0.0, time.time() - t.start_time)
+            percent, progress_label = compute_task_progress(t.files_done, t.files_total, elapsed)
+            bar.setValue(percent)
+            bar.setFormat(progress_label if t.files_total else "%p%")
 
         if t.status == "running":
             elapsed = time.time() - t.start_time
@@ -745,6 +775,12 @@ class MainWindow(QMainWindow):
         t = self.tasks.get(job_name)
         if t is None:
             return
+        now = time.monotonic()
+        last_emit = self._last_progress_emit_ts.get(job_name, 0.0)
+        min_delta = 1 if files_total <= 0 else max(1, files_total // 2000)
+        if files_total and (files_done - t.files_done) < min_delta and (now - last_emit) < 0.2:
+            return
+        self._last_progress_emit_ts[job_name] = now
         t.files_done = files_done
         t.files_total = files_total
         t.current_file = filename
