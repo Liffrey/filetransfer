@@ -83,6 +83,31 @@ class JobEditorDialog(QDialog):
         self.delete_check = QCheckBox("Dogrulama basarili olursa kaynaktan sil")
         form.addRow("Kaynagi Sil:", self.delete_check)
 
+        self.dry_run_check = QCheckBox("Dry-run / onizleme modu")
+        self.dry_run_check.setToolTip("Transfer gercekten yapilmaz; sadece hangi dosyalarin tasinacagini ve silinecegini onizler.")
+        form.addRow("Onizleme Modu:", self.dry_run_check)
+
+        self.resume_check = QCheckBox("Robocopy /Z ile devam et")
+        self.resume_check.setToolTip("Robocopy restartable modunu acar; yarim kalan buyuk dosya kopyalari surdurulebilir.")
+        form.addRow("Resume:", self.resume_check)
+
+        self.priority_spin = QSpinBox()
+        self.priority_spin.setRange(-10, 100)
+        self.priority_spin.setValue(0)
+        self.priority_spin.setToolTip("Daha yuksek deger, kuyrukta once islenir.")
+        form.addRow("Oncelik:", self.priority_spin)
+
+        self.delete_policy_combo = QComboBox()
+        self.delete_policy_combo.addItem("verified_only", "verified_only")
+        self.delete_policy_combo.addItem("never", "never")
+        self.delete_policy_combo.addItem("always (engellenir)", "always")
+        self.delete_policy_combo.setToolTip("Kaynak silme yalnizca dosya-bazli dogrulamadan sonra desteklenir. 'always' eski kayitlar icin engellenmistir.")
+        form.addRow("Silme Politikasi:", self.delete_policy_combo)
+
+        self.require_preview_delete_check = QCheckBox("Silme oncesi onizleme zorunlu")
+        self.require_preview_delete_check.setChecked(True)
+        form.addRow("Silme Onizleme:", self.require_preview_delete_check)
+
         self.retries_spin = QSpinBox()
         self.retries_spin.setRange(0, 20)
         self.retries_spin.setValue(3)
@@ -265,6 +290,13 @@ class JobEditorDialog(QDialog):
         self.age_spin.setValue(job.older_than_days)
         self.filter_edit.setText(job.file_filter)
         self.delete_check.setChecked(job.delete_after_transfer)
+        self.dry_run_check.setChecked(job.dry_run)
+        self.resume_check.setChecked(job.resume_from_checkpoint)
+        self.priority_spin.setValue(job.priority)
+        idx = self.delete_policy_combo.findData(job.delete_policy)
+        if idx >= 0:
+            self.delete_policy_combo.setCurrentIndex(idx)
+        self.require_preview_delete_check.setChecked(job.require_preview_for_delete)
         self.retries_spin.setValue(job.max_retries)
         self.threads_spin.setValue(job.robocopy_threads)
         idx = self.verify_combo.findText(job.verification_mode)
@@ -300,6 +332,12 @@ class JobEditorDialog(QDialog):
             return
         if not source or not dest:
             QMessageBox.warning(self, "Hata", "Kaynak ve hedef yol zorunludur.")
+            return
+        if self.delete_check.isChecked() and self.delete_policy_combo.currentData() == "always":
+            QMessageBox.warning(
+                self, "Silme Politikasi",
+                "'always' guvenli degil ve desteklenmiyor. 'verified_only' veya 'never' secin.",
+            )
             return
         if not self.is_edit and name.lower() in {n.lower() for n in self.existing_names}:
             QMessageBox.warning(self, "Hata", f"Bu isimde bir job zaten var: {name}")
@@ -410,6 +448,11 @@ class JobEditorDialog(QDialog):
             older_than_days=self.age_spin.value(),
             file_filter=self.filter_edit.text().strip() or "*.*",
             delete_after_transfer=self.delete_check.isChecked(),
+            dry_run=self.dry_run_check.isChecked(),
+            resume_from_checkpoint=self.resume_check.isChecked(),
+            priority=self.priority_spin.value(),
+            delete_policy=self.delete_policy_combo.currentData(),
+            require_preview_for_delete=self.require_preview_delete_check.isChecked(),
             max_retries=self.retries_spin.value(),
             disk_warn_threshold_pct=self.warn_spin.value(),
             disk_critical_threshold_pct=self.crit_spin.value(),

@@ -68,6 +68,35 @@ class RobocopyProgress:
 ProgressCallback = Callable[[RobocopyProgress], None]
 
 
+def _build_robocopy_args(
+    source: str,
+    destination: str,
+    file_filter: str,
+    older_than_days: int,
+    max_retries: int,
+    threads: int,
+    restartable: bool = False,
+) -> list[str]:
+    args = [
+        "robocopy",
+        source,
+        destination,
+        file_filter,
+        "/E",
+        "/COPY:DAT",
+        f"/MT:{max(1, min(128, threads))}",
+        f"/R:{max_retries}",
+        "/W:5",
+        "/BYTES",
+        "/NDL",
+    ]
+    if restartable:
+        args.append("/Z")
+    if older_than_days > 0:
+        args.append(f"/MINAGE:{older_than_days}")
+    return args
+
+
 def _terminate_process_tree(proc) -> None:
     """Windows'ta robocopy altindaki tum islem agacini temiz kapatir."""
     if proc is None:
@@ -132,6 +161,7 @@ def run_robocopy_with_progress(
     cancel_event: Optional[threading.Event] = None,
     total_files: int = 0,
     on_log: Optional[Callable[[str], None]] = None,
+    restartable: bool = False,
 ) -> tuple[int, "__import__('datetime').timedelta"]:
     """
     Robocopy'yi calistirir, ilerleme yuzdesini CANLI olarak on_progress'e
@@ -155,22 +185,10 @@ def run_robocopy_with_progress(
     """
     import datetime
 
-    args = [
-        "robocopy",
-        source,
-        destination,
-        file_filter,
-        "/E",
-        "/COPY:DAT",
-        f"/MT:{max(1, min(128, threads))}",
-        f"/R:{max_retries}",
-        "/W:5",
-        "/BYTES",
-        "/NDL",  # dizin listesini yine de bastir - satir sayisini makul tutar
-        # DIKKAT: /NP ve /LOG+ KASITLI OLARAK KULLANILMIYOR (yukaridaki aciklamaya bakin)
-    ]
-    if older_than_days > 0:
-        args.append(f"/MINAGE:{older_than_days}")
+    args = _build_robocopy_args(
+        source, destination, file_filter, older_than_days, max_retries,
+        threads, restartable=restartable,
+    )
 
 
     Path(robocopy_log).parent.mkdir(parents=True, exist_ok=True)

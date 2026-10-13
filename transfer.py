@@ -37,6 +37,7 @@ from engine.credentials import CredentialStore, resolve_unc_server
 from engine.scanner import scan_directory, build_rel_index
 from engine.joblock import JobLock, JobLockError
 from engine.robocopy_runner import run_robocopy_with_progress, RobocopyProgress
+from checkpoint import CheckpointJournal, checkpoint_signature
 
 
 @dataclass(slots=True)
@@ -94,6 +95,7 @@ class TransferResult:
     skipped_files: int = 0
     transferred_bytes: int = 0
     duration: str = ""
+    dry_run: bool = False
 
 
 # Robocopy exit kodu bit anlami:
@@ -113,6 +115,92 @@ class TransferResult:
 # kodundan cok daha faydali bir sonuc).
 ROBOCOPY_FATAL_MASK = 16
 ROBOCOPY_FILE_ERROR_BIT = 8
+PREVIEW_RECEIPT_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def build_transfer_plan(job: TransferJob, files: list, checkpoint_files: Optional[set[str]] = None) -> dict:
+    """Ilk 4 urun adimi icin makul bir plan uretir: dry run, resume skip, queue order, delete policy."""
+    checkpoint_files = checkpoint_files or set()
+    rel_names = [getattr(f, "rel_path", getattr(f, "path", "")) for f in files]
+    transfer_candidates = []
+    skipped_resume = []
+    for rel in rel_names:
+        if rel in checkpoint_files:
+            skipped_resume.append(rel)
+            continue
+        transfer_candidates.append(rel)
+    return {
+        "dry_run": bool(getattr(job, "dry_run", False)),
+        "resume_from_checkpoint": bool(getattr(job, "resume_from_checkpoint", False)),
+        "would_transfer": transfer_candidates,
+        "skipped_resume": skipped_resume,
+        "would_delete": bool(
+            getattr(job, "delete_after_transfer", False)
+            and getattr(job, "delete_policy", "verified_only") == "verified_only"
+            and getattr(job, "verification_mode", "FullHash") in ("FullHash", "SizeOnly")
+        ),
+        "delete_policy": getattr(job, "delete_policy", "verified_only"),
+        "priority": int(getattr(job, "priority", 0)),
+        "require_preview_for_delete": bool(getattr(job, "require_preview_for_delete", True)),
+    }
+
+
+def _deletion_guard(job: TransferJob, preview_matches: bool) -> tuple[bool, str]:
+    """Return whether source deletion is permitted; every ambiguous state fails closed."""
+    if not job.delete_after_transfer:
+        return False, "Kaynak silme job ayarlarinda kapali."
+    if job.delete_policy == "never":
+        return False, "Silme politikasi 'never'."
+    if job.delete_policy != "verified_only":
+        return False, f"Desteklenmeyen silme politikasi: {job.delete_policy}."
+    if job.verification_mode not in ("FullHash", "SizeOnly"):
+        return False, f"Dosya-bazli dogrulama modu desteklenmiyor: {job.verification_mode}."
+    if job.require_preview_for_delete and not preview_matches:
+        return False, "Guncel dry-run onizlemesi yok veya kaynak envanteri onizlemeden sonra degisti."
+    return True, ""
+
+
+def _preview_signature(job: TransferJob, files: list) -> str:
+    file_inventory = sorted(
+        (str(item.rel_path), int(item.size), float(item.mtime))
+        for item in files
+    )
+    payload = {
+        "job": job.name,
+        "source": os.path.normcase(os.path.abspath(job.source_path)),
+        "destination": os.path.normcase(os.path.abspath(job.destination_path)),
+        "file_filter": job.file_filter,
+        "older_than_days": job.older_than_days,
+        "verification_mode": job.verification_mode,
+        "delete_after_transfer": job.delete_after_transfer,
+        "delete_policy": job.delete_policy,
+        "files": file_inventory,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _write_preview_receipt(path: Path, signature: str) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps({"signature": signature, "created_at": time.time()}),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _preview_receipt_matches(path: Path, signature: str) -> bool:
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(receipt, dict) or receipt.get("signature") != signature:
+        return False
+    created_at = receipt.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        return False
+    age_seconds = time.time() - created_at
+    return 0 <= age_seconds <= PREVIEW_RECEIPT_MAX_AGE_SECONDS
 
 
 def _robocopy_exit_description(code: int) -> list[str]:
@@ -599,7 +687,8 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                   cancel_event: Optional[threading.Event] = None,
                   lock_dir: Optional[str] = None,
                   on_progress: Optional[Callable[[RobocopyProgress], None]] = None,
-                  on_stage: Optional[Callable[[str], None]] = None) -> TransferResult:
+                  on_stage: Optional[Callable[[str], None]] = None,
+                  checkpoint_files: Optional[set[str]] = None) -> TransferResult:
     """
     Bir job'u calistirir: yas filtreli robocopy + hash/boyut dogrulama +
     disk kontrolu + log/hashlog/JSON-ozet uretimi.
@@ -635,8 +724,11 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
     hash_log_file = log_dir / f"HashLog_{safe_name}_{run_id}.log"
     summary_json = log_dir / f"Summary_{safe_name}_{run_id}.json"
     report_html = log_dir / f"Report_{safe_name}_{run_id}.html"
+    preview_receipt_path = log_dir / f"Preview_{safe_name}.json"
+    checkpoint_path = log_dir / f"Checkpoint_{safe_name}.jsonl"
 
     logger = EngineLogger(log_file)
+    checkpoint_journal: Optional[CheckpointJournal] = None
     if on_log:
         original_log = logger.log
         def hooked_log(message, level="INFO", console=True):
@@ -648,13 +740,47 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         logger.log = hooked_log  # type: ignore
 
     def stage(text: str) -> None:
+        if checkpoint_journal is not None:
+            try:
+                checkpoint_journal.record_stage(text)
+            except OSError as e:
+                logger.warn(f"Checkpoint asama bilgisi yazilamadi: {e}")
         if on_stage:
             on_stage(text)
+
+    def record_verified_checkpoint(
+        rel_path: str,
+        size: int,
+        mtime: float,
+        verification_mode: str,
+        verified_hash: str = "",
+    ) -> None:
+        if checkpoint_journal is None:
+            return
+        try:
+            checkpoint_journal.record_verified(rel_path, size, mtime, verification_mode, verified_hash)
+        except OSError as e:
+            logger.warn(f"Checkpoint dosya kaydi yazilamadi ({rel_path}): {e}")
 
     hash_log_created = False  # HashLogWriter GERCEKTEN tamamlanip dosyayi kapattiginda True olur
     report_data: dict = {}
 
     def result(success: bool, error: str = "", **extra) -> TransferResult:
+        if checkpoint_journal is not None:
+            checkpoint_status = (
+                "success" if success else
+                "cancelled" if error == "Kullanici tarafindan durduruldu" else
+                "failed"
+            )
+            try:
+                checkpoint_journal.finish(
+                    checkpoint_status,
+                    extra.get("verified_files", 0),
+                    extra.get("total_files", 0),
+                    error,
+                )
+            except OSError as e:
+                logger.warn(f"Checkpoint sonucu yazilamadi: {e}")
         finished_at = datetime.datetime.now().astimezone()
         elapsed_seconds = round(time.monotonic() - run_started_clock, 2)
         report_summary = {
@@ -675,6 +801,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             "result": {
                 "success": success,
                 "error_message": error,
+                "dry_run": bool(extra.get("dry_run", job.dry_run)),
                 "robocopy_exit": extra.get("robocopy_exit"),
                 "total": extra.get("total_files", 0),
                 "verified": extra.get("verified_files", 0),
@@ -720,6 +847,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
     logger.info(f"Hedef     : {job.destination_path}")
     logger.info(f"Filtre    : {job.file_filter}  |  Yas: >{job.older_than_days} gun")
     logger.info(f"Dogrulama : {job.verification_mode}  |  Robocopy /MT: {job.robocopy_threads}")
+    if job.dry_run:
+        logger.warn("Dry-run modu aktif: gercek transfer yapilmadan sadece onizleme uretilecek.")
+    if job.resume_from_checkpoint:
+        logger.warn("Robocopy restartable modu aktif (/Z): yarim kalan dosya kopyalari surdurulebilir.")
     logger.header("-" * 64)
 
     stage("Baslatiliyor")
@@ -732,6 +863,22 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             except JobLockError as e:
                 logger.error(str(e))
                 return result(False, str(e))
+
+        try:
+            checkpoint_journal = CheckpointJournal(
+                checkpoint_path,
+                checkpoint_signature(job),
+                resume=job.resume_from_checkpoint,
+            )
+        except OSError as e:
+            logger.error(f"Checkpoint acilamadi: {e}")
+            if job.resume_from_checkpoint:
+                return result(False, f"Checkpoint acilamadi: {e}")
+        if job.resume_from_checkpoint:
+            if checkpoint_journal is not None and checkpoint_journal.resumed:
+                logger.info(f"Checkpoint yuklendi: {len(checkpoint_journal.records):,} onceki dogrulanmis dosya kaydi.")
+            else:
+                logger.info("Uyumlu checkpoint bulunamadi; yeni checkpoint baslatiliyor.")
 
         if not job.source_path or not job.destination_path:
             logger.error("Kaynak/Hedef tanimlanmamis!")
@@ -760,12 +907,15 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             return result(False, "Kaynak erisilemiyor")
 
         if not os.path.exists(job.destination_path):
-            logger.warn("Hedef yok, olusturuluyor...")
-            try:
-                os.makedirs(job.destination_path, exist_ok=True)
-            except OSError as e:
-                logger.error(f"Hedef olusturulamadi: {e}")
-                return result(False, "Hedef olusturulamadi")
+            if job.dry_run:
+                logger.info("Hedef henuz yok; dry-run sirasinda olusturulmayacak.")
+            else:
+                logger.warn("Hedef yok, olusturuluyor...")
+                try:
+                    os.makedirs(job.destination_path, exist_ok=True)
+                except OSError as e:
+                    logger.error(f"Hedef olusturulamadi: {e}")
+                    return result(False, "Hedef olusturulamadi")
 
         # ---- Yas filtreli dosya listesi (hizli paralel tarama) ----
         stage("Kaynak taraniyor")
@@ -801,6 +951,58 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         src_files = scan_result.matched
         skipped = scan_result.skipped_count
         logger.info(f"Tarama tamam: Tasinacak={len(src_files)}  Atlanacak(daha yeni)={skipped}")
+        source_mtime_by_rel = {item.rel_path.casefold(): item.mtime for item in src_files}
+        if checkpoint_journal is not None and checkpoint_journal.resumed:
+            matching_checkpoint_files = checkpoint_journal.matching_count(src_files)
+            logger.info(
+                f"Checkpoint'te kaynak metadata'si eslesen {matching_checkpoint_files:,} dosya var. "
+                "Robocopy mevcut dosyalari kontrol edecek ve tum dosyalar yeniden dogrulanacak."
+            )
+
+        checkpoint_set = set(checkpoint_files or set())
+        all_src_files_for_plan = list(src_files)
+        current_preview_signature = _preview_signature(job, all_src_files_for_plan)
+        preview_matches = (
+            scan_result.error_count == 0
+            and _preview_receipt_matches(preview_receipt_path, current_preview_signature)
+        )
+        if job.resume_from_checkpoint and checkpoint_set:
+            plan = build_transfer_plan(job, all_src_files_for_plan, checkpoint_set)
+            if plan["skipped_resume"]:
+                logger.warn(f"Resume/checkpoint nedeniyle atlanacak dosya sayisi: {len(plan['skipped_resume'])}")
+                for rel in plan["skipped_resume"][:10]:
+                    logger.info(f"  Atlandi: {rel}")
+            src_files = [f for f in src_files if getattr(f, "rel_path", getattr(f, "path", "")) not in checkpoint_set]
+
+        if job.dry_run:
+            stage("Dry-run onizleme")
+            preview_plan = build_transfer_plan(job, all_src_files_for_plan, checkpoint_set)
+            logger.success(f"Dry-run tamamlandi. {len(preview_plan['would_transfer'])} dosya tasinacak; {len(preview_plan['skipped_resume'])} dosya atlandi.")
+            if job.delete_after_transfer:
+                if job.delete_policy == "verified_only" and job.verification_mode != "None" and scan_result.error_count == 0:
+                    try:
+                        _write_preview_receipt(preview_receipt_path, current_preview_signature)
+                        logger.success("Silme onizlemesi kaydedildi; gercek calistirmada envanter ayniysa dogrulanmis dosyalar silinebilir.")
+                    except OSError as e:
+                        logger.error(f"Silme onizlemesi kaydedilemedi; kaynak silme engellenecek: {e}")
+                else:
+                    logger.warn("Silme onizlemesi onaylanamadi: politika, dogrulama modu veya tarama hatalarini kontrol edin.")
+            if preview_plan["would_transfer"]:
+                for rel in preview_plan["would_transfer"][:20]:
+                    logger.info(f"  Preview: {rel}")
+            return result(
+                True,
+                total_files=len(preview_plan["would_transfer"]),
+                skipped_files=len(preview_plan["skipped_resume"]) + skipped,
+                transferred_bytes=0,
+                dry_run=True,
+            )
+
+        if job.delete_after_transfer and job.require_preview_for_delete:
+            if preview_matches:
+                logger.info("Silme onizlemesi mevcut ve kaynak envanteriyle eslesiyor.")
+            else:
+                logger.warn("Eslesen, hatasiz bir dry-run onizlemesi yok; transfer devam edebilir ancak kaynak silme engellenecek.")
 
         if not src_files:
             logger.success("Tasinacak dosya yok.")
@@ -852,6 +1054,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             job.source_path, job.destination_path, job.file_filter,
             job.older_than_days, job.max_retries, job.robocopy_threads, str(robocopy_log),
             on_progress=on_progress, cancel_event=cancel_event, total_files=len(src_files),
+            restartable=job.resume_from_checkpoint,
             on_log=lambda msg: logger.warn(msg, console=True),
         )
 
@@ -965,6 +1168,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         elif dh == info.hash:
                             verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_path))
                             hlw.add_entry(info.rel, info.hash, dh, sz, "OK")
+                            record_verified_checkpoint(
+                                info.rel, info.size, source_mtime_by_rel.get(rel_key, 0.0),
+                                "FullHash", info.hash,
+                            )
                         else:
                             logger.error(f"HASH UYUMSUZ: {info.rel}  Kaynak={info.hash}  Hedef={dh}", console=False)
                             failed.append(FailedFileInfo(rel=info.rel, src_hash=info.hash, dst_hash=dh))
@@ -982,6 +1189,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         if sz == info.size:
                             verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_entry.path))
                             hlw.add_entry(info.rel, src_hash_label, f"(boyut:{format_size(sz)})", sz, "OK")
+                            record_verified_checkpoint(
+                                info.rel, info.size, source_mtime_by_rel.get(rel_key, 0.0),
+                                "SizeOnly",
+                            )
                         else:
                             logger.error(f"BOYUT UYUMSUZ: {info.rel}  Kaynak={format_size(info.size)}  Hedef={format_size(sz)}", console=False)
                             failed.append(FailedFileInfo(rel=info.rel, src_hash=f"SIZE:{info.size}", dst_hash=f"SIZE:{sz}"))
@@ -1005,6 +1216,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         src_info = hash_table[f.rel.lower()]
                         verified.append(VerifiedFileInfo(rel=f.rel, size=f.size, src_file=src_info.src, dst_file=f.dst_path))
                         hlw.add_entry(f.rel, f.src_hash, f.dst_hash, f.size, "OK")
+                        record_verified_checkpoint(
+                            f.rel, src_info.size, source_mtime_by_rel.get(f.rel.casefold(), 0.0),
+                            job.verification_mode, src_info.hash if job.verification_mode == "FullHash" else "",
+                        )
                     for f in still_bad:
                         hlw.add_entry(f.rel, f.src_hash, f.dst_hash, f.size, f.result)
                     if fixed:
@@ -1072,75 +1287,45 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
 
         # ---- Silme ----
         if job.delete_after_transfer:
-            if job.verification_mode == "None":
-                # Dogrulama yapilmadigi icin dosya-bazli sonuc YOK - sadece
-                # robocopy'nin genel exit koduna guvenilebilir.
-                if job_ok:
-                    stage("Kaynak dosyalar siliniyor")
-                    logger.warn(f"Kaynak dosyalar siliniyor... ({len(src_files)} dosya, dogrulama atlandi)")
-                    src_paths = [f.path for f in src_files]
-                    def on_delete_progress(done, tot):
-                        emit_delete_progress(done, tot, "Kaynak dosyalar siliniyor")
-                        logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya")
-                    del_ok, del_errors = delete_files_parallel(
-                        src_paths, max_workers=job.robocopy_threads,
-                        progress_callback=on_delete_progress,
-                        cancel_event=cancel_event,
-                        max_retries=job.max_retries, logger=logger,
-                    )
-                    for p, err in del_errors:
-                        logger.error(f"Silinemedi: {p} — {err}", console=False)
-                    if not del_errors:
-                        logger.success(f"Tum kaynak dosyalar silindi ({del_ok} dosya).")
-                    else:
-                        logger.warn(f"{del_ok} dosya silindi, {len(del_errors)} dosya silinemedi.")
-                    dirs_removed, dir_errors = remove_empty_dirs(job.source_path)
-                    if dirs_removed:
-                        logger.info(f"Bos kalan {dirs_removed} kaynak klasoru de silindi.")
-                    for d, err in dir_errors:
-                        logger.warn(f"Bos klasor silinemedi: {d} — {err}", console=False)
-                else:
-                    logger.warn("Dogrulama atlandi (VerificationMode=None) ve robocopy basarisiz raporladi — kaynak SILINMEDI.")
+            deletion_allowed, deletion_reason = _deletion_guard(job, preview_matches)
+            if not deletion_allowed:
+                logger.warn(f"Kaynak dosyalar SILINMEDI: {deletion_reason}")
+            elif not verified:
+                logger.warn("Silinecek dogrulanmis dosya yok — kaynak SILINMEDI.")
             else:
-                # Dosya-bazli dogrulama VAR: sadece TEK TEK dogrulanmis (ilk
-                # denemede ya da yukaridaki tekrar-deneme sonrasi) dosyalar
-                # kaynaktan silinir. Hala basarisiz/eksik kalanlar guvenlik
-                # icin kaynakta BIRAKILIR - is genel olarak "basarisiz"
-                # raporlansa bile (ornegin 200000 dosyadan sadece 2'si
-                # sorunluysa) dogrulanan 199998 dosya YINE DE silinir; bu
-                # durum asagida NET olarak loglanir.
-                if verified:
-                    stage("Kaynak dosyalar siliniyor")
-                    logger.warn(f"Kaynak dosyalar siliniyor... ({len(verified)} dogrulanmis dosya)")
-                    verified_paths = [v.src_file for v in verified]
-                    def on_delete_progress(done, tot):
-                        emit_delete_progress(done, tot, "Kaynak dosyalar siliniyor")
-                        logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya")
-                    del_ok, del_errors = delete_files_parallel(
-                        verified_paths, max_workers=job.robocopy_threads,
-                        progress_callback=on_delete_progress,
-                        cancel_event=cancel_event,
-                        max_retries=job.max_retries, logger=logger,
-                    )
-                    for p, err in del_errors:
-                        logger.error(f"Silinemedi: {p} — {err}", console=False)
-                    if not del_errors:
-                        logger.success(f"Dogrulanan {del_ok} kaynak dosya silindi.")
-                    else:
-                        logger.warn(f"{del_ok} dosya silindi, {len(del_errors)} dosya silinemedi (detay: log dosyasi).")
-                    dirs_removed, dir_errors = remove_empty_dirs(job.source_path)
-                    if dirs_removed:
-                        logger.info(f"Bos kalan {dirs_removed} kaynak klasoru de silindi.")
-                    for d, err in dir_errors:
-                        logger.warn(f"Bos klasor silinemedi: {d} — {err}", console=False)
-                else:
-                    logger.warn("Silinecek dogrulanmis dosya yok — kaynak SILINMEDI.")
+                stage("Kaynak dosyalar siliniyor")
+                logger.warn(f"Kaynak dosyalar siliniyor... ({len(verified)} dogrulanmis dosya)")
+                verified_paths = [item.src_file for item in verified]
 
-                if failed or missing:
-                    logger.error(
-                        f"{len(failed) + len(missing)} dosya tekrar denemeye ragmen basarisiz/eksik kaldi — "
-                        f"BU DOSYALAR KAYNAKTA KORUNDU (silinmedi). Detaylar hash logunda: {hash_log_file}"
-                    )
+                def on_delete_progress(done, tot):
+                    emit_delete_progress(done, tot, "Kaynak dosyalar siliniyor")
+                    logger.info(f"  Siliniyor... {done:,}/{tot:,} dosya")
+
+                del_ok, del_errors = delete_files_parallel(
+                    verified_paths,
+                    max_workers=job.robocopy_threads,
+                    progress_callback=on_delete_progress,
+                    cancel_event=cancel_event,
+                    max_retries=job.max_retries,
+                    logger=logger,
+                )
+                for path, error in del_errors:
+                    logger.error(f"Silinemedi: {path} — {error}", console=False)
+                if not del_errors:
+                    logger.success(f"Dogrulanan {del_ok} kaynak dosya silindi.")
+                else:
+                    logger.warn(f"{del_ok} dosya silindi, {len(del_errors)} dosya silinemedi (detay: log dosyasi).")
+                dirs_removed, dir_errors = remove_empty_dirs(job.source_path)
+                if dirs_removed:
+                    logger.info(f"Bos kalan {dirs_removed} kaynak klasoru de silindi.")
+                for directory, error in dir_errors:
+                    logger.warn(f"Bos klasor silinemedi: {directory} — {error}", console=False)
+
+            if failed or missing:
+                logger.error(
+                    f"{len(failed) + len(missing)} dosya tekrar denemeye ragmen basarisiz/eksik kaldi — "
+                    f"BU DOSYALAR KAYNAKTA KORUNDU (silinmedi). Detaylar hash logunda: {hash_log_file}"
+                )
 
         # ---- JSON ve HTML rapor ozeti ----
         summary = {
@@ -1190,6 +1375,11 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         )
 
     finally:
+        if checkpoint_journal is not None:
+            try:
+                checkpoint_journal.close()
+            except OSError as e:
+                logger.warn(f"Checkpoint kapatilamadi: {e}")
         if credential_store:
             for target in smb_targets:
                 credential_store.unregister_smb_session(target)

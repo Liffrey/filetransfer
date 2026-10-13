@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import Optional
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QDialog,
 )
 
-from engine.config import JobConfigStore, TransferJob, DEFAULT_LOG_DIR
+from engine.config import JobConfigStore, TransferJob, DEFAULT_LOG_DIR, order_queued_jobs, sort_jobs_for_queue
 from engine.credentials import CredentialStore
 from engine.transfer import run_transfer, TransferResult
 from engine.scheduler import register_scheduled_task, unregister_scheduled_task
@@ -66,16 +66,20 @@ ABOUT_TEXT = """Transfer Console
 
 Dosya aktarimi, butunluk dogrulamasi ve raporlama araci
 
-Surum 1.19
+Surum 2.0.0
 14 Ekim 2026
 
 Robocopy tabanli aktarim
 SHA-256 veya dosya boyutu ile dogrulama
 JSON ve HTML calisma raporlari
+Kalici checkpoint ve guvenli resume
+Oncelik tabanli, FIFO baglayicili job kuyrugu
+Dry-run onizlemesi ve dogrulanmis silme korumalari
 """
 
 TASK_COLUMNS = ["Job", "Durum", "Asama", "Ilerleme", "Sure", ""]
 TASK_JOB_COL, TASK_STATUS_COL, TASK_STAGE_COL, TASK_PROGRESS_COL, TASK_DURATION_COL, TASK_CLOSE_COL = range(len(TASK_COLUMNS))
+MAX_CONCURRENT_JOBS = 2
 
 
 @dataclass
@@ -194,6 +198,9 @@ class MainWindow(QMainWindow):
         # ayrica run_transfer icindeki JobLock ile (surecler-arasi, ornegin
         # Gorev Zamanlayici ile cakisma icin) engellenir.
         self.workers: dict[str, TransferWorker] = {}
+        self.pending_jobs: dict[str, int] = {}
+        self.pending_modes: dict[str, str] = {}
+        self._enqueue_sequence = 0
         self.schedule_delete_workers: dict[str, ScheduleDeleteWorker] = {}
         # Her calisan/az once biten job icin CANLI durum - hem ana tablonun
         # Ilerleme sutununu hem de asagidaki ayri "Gorevler" panelini besler
@@ -235,8 +242,13 @@ class MainWindow(QMainWindow):
         self.btn_edit = QPushButton("Duzenle")
         self.btn_delete = QPushButton("Sil")
 
-        self.btn_run = QPushButton("▶ Simdi Calistir")
+        self.btn_run = QPushButton("▶ Kuyruga Ekle")
         self.btn_run.setProperty("primary", True)
+        self.btn_dry_run = QPushButton("Onizleme")
+        self.btn_dry_run.setToolTip("Secili job'u dosya kopyalamadan dry-run olarak calistirir.")
+        self.btn_resume = QPushButton("Devam Et (/Z)")
+        self.btn_resume.setToolTip("Secili job'u Robocopy restartable modunda calistirir.")
+        self.btn_priority = QPushButton("Oncelik")
         self.btn_stop = QPushButton("■ Durdur")
         self.btn_stop.setProperty("danger", True)
         self.btn_stop.setEnabled(False)
@@ -262,7 +274,7 @@ class MainWindow(QMainWindow):
         for b in (self.btn_new, self.btn_edit, self.btn_delete):
             toolbar.addWidget(b)
         add_separator()
-        for b in (self.btn_run, self.btn_stop):
+        for b in (self.btn_run, self.btn_dry_run, self.btn_resume, self.btn_stop, self.btn_priority):
             toolbar.addWidget(b)
         add_separator()
         for b in (self.btn_schedule, self.btn_unschedule):
@@ -368,6 +380,9 @@ class MainWindow(QMainWindow):
         self.btn_edit.clicked.connect(self._on_edit)
         self.btn_delete.clicked.connect(self._on_delete)
         self.btn_run.clicked.connect(self._on_run)
+        self.btn_dry_run.clicked.connect(lambda: self._on_run("dry_run"))
+        self.btn_resume.clicked.connect(lambda: self._on_run("resume"))
+        self.btn_priority.clicked.connect(self._on_set_priority)
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_schedule.clicked.connect(self._on_schedule)
         self.btn_unschedule.clicked.connect(self._on_unschedule)
@@ -395,7 +410,7 @@ class MainWindow(QMainWindow):
         # islemin) log dosyasini acar.
         selected_name = self._selected_job_name()
 
-        jobs = self.config_store.load()
+        jobs = sort_jobs_for_queue(self.config_store.load())
 
         self.table.setSortingEnabled(False)  # doldururken siralama satirlari kaydirmasin
         self.table.setRowCount(len(jobs))
@@ -433,7 +448,8 @@ class MainWindow(QMainWindow):
         self.empty_label.setVisible(len(jobs) == 0)
         self.table.setVisible(len(jobs) > 0)
         running_count = len(self.workers)
-        suffix = f" ({running_count} job calisiyor)" if running_count else ""
+        queued_count = len(self.pending_jobs)
+        suffix = f" ({running_count} aktif, {queued_count} kuyrukta)" if running_count or queued_count else ""
         self.status.showMessage(f"{len(jobs)} job yuklendi.{suffix}")
 
         if selected_name is not None:
@@ -483,15 +499,19 @@ class MainWindow(QMainWindow):
         return btn
 
     def _update_run_stop_buttons(self) -> None:
-        """Secili job'a gore Calistir/Durdur butonlarini gunceller. Birden
-        fazla job ayni anda calisiyor olabilir - her job'un kendi asamasi
-        asagidaki Gorevler panelinde gorulur."""
+        """Update selected-job actions for running and queued state."""
         job = self._selected_job()
         running = bool(job) and job.name in self.workers and self.workers[job.name].isRunning()
+        queued = bool(job) and job.name in self.pending_jobs
 
-        self.btn_run.setEnabled(job is not None and not running)
-        self.btn_run.setText("Calisiyor..." if running else "▶ Simdi Calistir")
-        self.btn_stop.setEnabled(running)
+        self.btn_run.setEnabled(job is not None and not running and not queued)
+        self.btn_run.setText("Calisiyor..." if running else ("Kuyrukta" if queued else "▶ Kuyruga Ekle"))
+        self.btn_stop.setEnabled(running or queued)
+        self.btn_stop.setText("Kuyruktan Cikar" if queued else "■ Durdur")
+        for button in (self.btn_dry_run, self.btn_resume):
+            button.setEnabled(job is not None and not running and not queued)
+        self.btn_priority.setEnabled(job is not None and not running)
+        self.btn_priority.setText(f"Oncelik: {job.priority}" if job else "Oncelik")
 
     # -------------------------------------------------------- Gorevler paneli
 
@@ -505,6 +525,8 @@ class MainWindow(QMainWindow):
             return "❌ Hatali", status_error_bg(theme)
         if status == "cancelled":
             return "⏹ Durduruldu", status_cancelled_bg(theme)
+        if status == "queued":
+            return "🕒 Kuyrukta", status_running_bg(theme)
         return "⏳ Calisiyor", status_running_bg(theme)
 
     def _next_task_token(self) -> int:
@@ -566,9 +588,11 @@ class MainWindow(QMainWindow):
             elapsed = max(0.0, time.time() - t.start_time)
             percent, progress_label = compute_task_progress(t.files_done, t.files_total, elapsed)
             bar.setValue(percent)
-            bar.setFormat(progress_label if t.files_total else "%p%")
+            bar.setFormat("Kuyrukta" if t.status == "queued" else (progress_label if t.files_total else "%p%"))
 
-        if t.status == "running":
+        if t.status == "queued":
+            duration_text = "Kuyrukta"
+        elif t.status == "running":
             elapsed = time.time() - t.start_time
             duration_text = self._format_duration(elapsed)
         else:
@@ -580,7 +604,7 @@ class MainWindow(QMainWindow):
 
         close_btn = self.tasks_table.cellWidget(row, TASK_CLOSE_COL)
         if close_btn is not None:
-            close_btn.setVisible(t.status != "running")
+            close_btn.setVisible(t.status not in ("running", "queued"))
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -600,7 +624,7 @@ class MainWindow(QMainWindow):
         """Kullanici bir gorev satirini elle kapattiginda cagrilir - calisan
         bir job'un satiri kapatilamaz (buton zaten gizlenir, bkz. _update_task_row)."""
         t = self.tasks.get(job_name)
-        if t is not None and t.status == "running":
+        if t is not None and t.status in ("running", "queued"):
             return
         self.tasks.pop(job_name, None)
         row = self._task_row_for(job_name)
@@ -634,7 +658,7 @@ class MainWindow(QMainWindow):
         if not job:
             QMessageBox.warning(self, "Uyari", "Once bir job secin.")
             return
-        if job.name in self.workers and self.workers[job.name].isRunning():
+        if job.name in self.pending_jobs or (job.name in self.workers and self.workers[job.name].isRunning()):
             # Calisan bir job'un adi degistirilirse, worker'in self.workers
             # sozlugundeki (eski isimle kayitli) anahtari ile config'deki
             # yeni isim uyusmaz - calisma bitince update_run_result() yeni
@@ -660,7 +684,7 @@ class MainWindow(QMainWindow):
         if job.name in self.schedule_delete_workers:
             self.status.showMessage(f"'{job.name}' silme islemi zaten devam ediyor.")
             return
-        if job.name in self.workers and self.workers[job.name].isRunning():
+        if job.name in self.pending_jobs or (job.name in self.workers and self.workers[job.name].isRunning()):
             QMessageBox.warning(self, "Uyari", f"'{job.name}' su an calisiyor, once durdurun.")
             return
         reply = QMessageBox.question(
@@ -793,24 +817,92 @@ class MainWindow(QMainWindow):
         t.stage = stage_text
         self._update_task_row(job_name)
 
-    def _on_run(self):
+    def _on_run(self, mode: str = "normal"):
         job = self._selected_job()
         if not job:
             QMessageBox.warning(self, "Uyari", "Once bir job secin.")
             return
         existing = self.workers.get(job.name)
-        if existing is not None and existing.isRunning():
-            QMessageBox.warning(self, "Uyari", f"'{job.name}' zaten calisiyor.")
+        if (existing is not None and existing.isRunning()) or job.name in self.pending_jobs:
+            QMessageBox.warning(self, "Uyari", f"'{job.name}' zaten calisiyor veya kuyrukta.")
             return
 
+        if mode == "dry_run":
+            job = replace(job, dry_run=True, resume_from_checkpoint=False)
+        elif mode == "resume":
+            job = replace(job, dry_run=False, resume_from_checkpoint=True)
+
+        if job.delete_after_transfer and job.require_preview_for_delete and not job.dry_run:
+            answer = QMessageBox.question(
+                self,
+                "Kaynak Silme Onayi",
+                "Transfer baslatilsin mi? Kaynak dosyalar yalnizca guncel dry-run onizlemesiyle "
+                "eslesir ve dosya-bazli dogrulamadan gecerse silinebilir.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        self._enqueue_sequence += 1
+        self.pending_jobs[job.name] = self._enqueue_sequence
+        self.pending_modes[job.name] = mode
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        # NOT: her job'un KENDI log tamponu ayri tutulur (bkz. _log_job) -
-        # baska bir job'un ciktisiyla KARISMAZ.
-        self._log_job(job.name, f"=== Baslatiliyor [RunId: {run_id}] ===")
-        self.tasks[job.name] = JobTaskState(status="running")
+        mode_label = {"dry_run": "Dry-run onizleme", "resume": "Resume (/Z)"}.get(mode, "Normal")
+        self._log_job(job.name, f"=== Kuyruga eklendi: {mode_label} [RunId: {run_id}] ===")
+        self.tasks[job.name] = JobTaskState(stage="Kuyrukta", status="queued")
         self._update_task_row(job.name)
+        self._dispatch_queue()
+        self._update_run_stop_buttons()
+        self.refresh_grid()
+        self.status.showMessage(
+            f"'{job.name}' kuyruga eklendi. Aktif: {len(self.workers)} / {MAX_CONCURRENT_JOBS}; "
+            f"bekleyen: {len(self.pending_jobs)}"
+        )
 
+    def _dispatch_queue(self) -> None:
+        active_count = len(self.workers)
+        available_slots = MAX_CONCURRENT_JOBS - active_count
+        if available_slots <= 0 or not self.pending_jobs:
+            self._update_run_stop_buttons()
+            return
+
+        jobs_by_name = {job.name: job for job in self.config_store.load()}
+        stale_names = set(self.pending_jobs) - jobs_by_name.keys()
+        for name in stale_names:
+            self.pending_jobs.pop(name, None)
+            self.pending_modes.pop(name, None)
+            self.tasks.pop(name, None)
+        jobs = [jobs_by_name[name] for name in self.pending_jobs]
+        ordered_jobs = order_queued_jobs(jobs, self.pending_jobs)
+        for job in ordered_jobs[:available_slots]:
+            mode = self.pending_modes.pop(job.name, "normal")
+            self.pending_jobs.pop(job.name, None)
+            self._start_worker(job, mode)
+
+        self._update_run_stop_buttons()
+
+    def _start_worker(self, job: TransferJob, mode: str) -> None:
+        if mode == "dry_run":
+            job = replace(job, dry_run=True, resume_from_checkpoint=False)
+        elif mode == "resume":
+            job = replace(job, dry_run=False, resume_from_checkpoint=True)
+
+        state = self.tasks.setdefault(job.name, JobTaskState())
+        state.stage = "Baslatiliyor"
+        state.files_done = 0
+        state.files_total = 0
+        state.current_file = ""
+        state.status = "running"
+        state.start_time = time.time()
+        state.finished_at = None
+        self._update_task_row(job.name)
+        if not self._task_timer.isActive():
+            self._task_timer.start()
+
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        mode_label = {"dry_run": "Dry-run onizleme", "resume": "Resume/checkpoint", "normal": "Normal"}.get(mode, mode)
+        self._log_job(job.name, f"=== Baslatiliyor: {mode_label} [RunId: {run_id}] ===")
         worker = TransferWorker(job, self.cred_store, run_id, self.lock_dir)
         worker.log_line.connect(partial(self._on_worker_log, job.name))
         worker.file_update.connect(partial(self._on_worker_progress, job.name))
@@ -819,11 +911,44 @@ class MainWindow(QMainWindow):
         self.workers[job.name] = worker
         worker.start()
 
-        self.status.showMessage(f"'{job.name}' calisiyor... ({len(self.workers)} job aktif)")
+    def _on_set_priority(self):
+        job = self._selected_job()
+        if not job:
+            QMessageBox.warning(self, "Uyari", "Once bir job secin.")
+            return
+        if job.name in self.workers and self.workers[job.name].isRunning():
+            QMessageBox.warning(self, "Uyari", f"'{job.name}' calisirken onceligi degistirilemez.")
+            return
+        priority, accepted = QInputDialog.getInt(
+            self, "Job Onceligi", f"'{job.name}' icin oncelik (-10 ile 100):",
+            job.priority, -10, 100, 1,
+        )
+        if not accepted:
+            return
+        job.priority = priority
+        if not self.config_store.upsert_job(job):
+            QMessageBox.warning(self, "Hata", "Job onceligi kaydedilemedi.")
+            return
         self.refresh_grid()
+        self.status.showMessage(f"'{job.name}' onceligi {priority} olarak kaydedildi.")
+        self._dispatch_queue()
 
     def _on_stop(self):
         job = self._selected_job()
+        if job and job.name in self.pending_jobs:
+            self.pending_jobs.pop(job.name, None)
+            self.pending_modes.pop(job.name, None)
+            state = self.tasks.get(job.name)
+            if state is not None:
+                state.status = "cancelled"
+                state.stage = "Kuyruktan cikarildi"
+                state.finished_at = time.time()
+                self._update_task_row(job.name)
+            self._update_run_stop_buttons()
+            self.refresh_grid()
+            self.status.showMessage(f"'{job.name}' kuyruktan cikarildi.")
+            return
+
         worker = self.workers.get(job.name) if job else None
         if worker is None or not worker.isRunning():
             return
@@ -873,6 +998,7 @@ class MainWindow(QMainWindow):
             self._update_task_row(job_name)
 
         self.refresh_grid()
+        self._dispatch_queue()
 
     def _on_view_log(self, job_name: str) -> None:
         job = self.config_store.get_job(job_name)

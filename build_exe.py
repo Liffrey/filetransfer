@@ -57,6 +57,7 @@ def main():
         "--hidden-import", "config",
         "--hidden-import", "credentials",
         "--hidden-import", "transfer",
+        "--hidden-import", "checkpoint",
         "--hidden-import", "scheduler",
         "--hidden-import", "logutil",
         "--hidden-import", "main_window",

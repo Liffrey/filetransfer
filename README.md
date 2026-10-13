@@ -5,7 +5,10 @@ File Transfer Console is a PySide6-based Windows file transfer utility that prov
 ## Features
 
 - GUI and CLI execution modes
-- Run multiple transfer jobs concurrently from the GUI, tracked in a live "Gorevler" (Tasks) panel showing each job's stage, progress and duration, plus per-row Log/Hash Log buttons in the main grid and a separate live log view per job
+- Priority-based GUI queue with FIFO ordering for equal priorities and up to two concurrent jobs, tracked in a live "Gorevler" (Tasks) panel
+- Persistent per-job checkpoint journals record files only after verification; resume reloads compatible state, uses Robocopy restartable mode, and verifies the destination again
+- Dry-run previews and deletion guardrails: source deletion requires a matching, error-free preview no older than 24 hours, file-level verification, and explicit GUI confirmation
+- Per-row Log/Hash Log buttons in the main grid and a separate live log view per job
 - Per-run JSON summaries and self-contained HTML reports with timing, throughput, verification counts, failed/missing files, and links to logs; the latest report is available from each job row
 - Windows Task Scheduler integration, including scheduling jobs that run as a non-SYSTEM account
 - Robocopy-based transfer engine
@@ -58,6 +61,8 @@ This generates a self-contained executable:
 ```text
 dist\TransferConsole.exe
 ```
+
+The 2.0.0 release build includes the checkpoint module as a PyInstaller hidden import.
 
 ## Deployment Notes
 

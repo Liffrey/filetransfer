@@ -35,6 +35,11 @@ class TransferJob:
     older_than_days: int = 30
     file_filter: str = "*.*"
     delete_after_transfer: bool = False
+    dry_run: bool = False
+    resume_from_checkpoint: bool = False
+    priority: int = 0
+    delete_policy: str = "verified_only"  # verified_only | never | always
+    require_preview_for_delete: bool = True
     max_retries: int = 3
     disk_warn_threshold_pct: int = 80
     disk_critical_threshold_pct: int = 90
@@ -318,6 +323,23 @@ class JobConfigStore:
         return self.save(jobs, allow_empty_overwrite=False)
 
 
+def sort_jobs_for_queue(jobs: list["TransferJob"]) -> list["TransferJob"]:
+    """Queued execution order: higher priority first, then name for stable ordering."""
+    return sorted(jobs, key=lambda job: (-int(getattr(job, "priority", 0)), str(job.name).lower()))
+
+
+def order_queued_jobs(
+    jobs: list["TransferJob"],
+    enqueue_order: dict[str, int],
+) -> list["TransferJob"]:
+    """Order pending jobs by priority, keeping FIFO order for equal priorities."""
+    queued = [job for job in jobs if job.name in enqueue_order]
+    return sorted(
+        queued,
+        key=lambda job: (-int(getattr(job, "priority", 0)), enqueue_order[job.name]),
+    )
+
+
 def _normalize_keys(item: dict) -> dict:
     """PowerShell surumunden kalma PascalCase anahtarlari snake_case'e cevirir."""
     mapping = {
@@ -327,6 +349,11 @@ def _normalize_keys(item: dict) -> dict:
         "OlderThanDays": "older_than_days",
         "FileFilter": "file_filter",
         "DeleteAfterTransfer": "delete_after_transfer",
+        "DryRun": "dry_run",
+        "ResumeFromCheckpoint": "resume_from_checkpoint",
+        "Priority": "priority",
+        "DeletePolicy": "delete_policy",
+        "RequirePreviewForDelete": "require_preview_for_delete",
         "MaxRetries": "max_retries",
         "DiskWarnThresholdPct": "disk_warn_threshold_pct",
         "DiskCriticalThresholdPct": "disk_critical_threshold_pct",
