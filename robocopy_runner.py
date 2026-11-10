@@ -39,10 +39,10 @@ from typing import Callable, Optional
 # Ornekler: " 45.2%", "100%", "  0%"
 _PERCENT_RE = re.compile(r'^\s*(\d{1,3}(?:\.\d+)?)\s*%\s*$')
 
-# "Yeni dosya kopyalaniyor" satiri (best-effort - robocopy surumune gore
-# bicimi hafif degisebilir, bu yuzden esnek/genis bir kalip kullanilir).
+# Kopyalama durumlu dosya satirlari. Robocopy'nin Older/Extra gibi kopyalama
+# yapmayan durumlari ilerleme sayacina dahil edilmez.
 _FILE_LINE_RE = re.compile(
-    r'^\s*(?:New File|Newer|Changed|\*EXTRA File|Older|Tweaked)\s+\S+\s+(.+?)\s*$',
+    r'^\s*(?:New File|Newer|Changed)\s+\S+\s+(.+?)\s*$',
     re.IGNORECASE,
 )
 
@@ -211,6 +211,7 @@ def run_robocopy_with_progress(
     current_file = ""
     was_cancelled = False
     files_seen = 0  # su ana kadar goruntlenen "yeni dosya" satiri sayisi
+    current_file_pending = False
     last_ui_emit = 0.0
     last_reported_files_done = -1
     last_reported_percent = -1.0
@@ -270,7 +271,7 @@ def run_robocopy_with_progress(
 
     try:
         while True:
-            if proc.poll() is not None and not line_queue:
+            if proc.poll() is not None and stop_flag[0] and not line_queue:
                 # Surec bitti VE bekleyen satir kalmadi
                 break
 
@@ -297,9 +298,10 @@ def run_robocopy_with_progress(
 
             file_match = _FILE_LINE_RE.match(line)
             if file_match:
-                # Yeni bir dosya satiri = BIR ONCEKI dosya tamamlandi demektir.
-                files_seen += 1
+                if current_file_pending:
+                    files_seen += 1
                 current_file = file_match.group(1).strip()
+                current_file_pending = True
                 emit_progress(0.0)
 
             err_match = _ERROR_LINE_RE.match(line)
@@ -340,9 +342,9 @@ def run_robocopy_with_progress(
     if was_cancelled:
         return -1, duration
 
-    # Surec bitti - son dosya da tamamlanmis sayilir (basarili/hatali farketmez,
-    # robocopy bir sonraki dosyaya GECMISTIR artik).
-    files_seen += 1
+    # Son dosya da sayilir; hic kopyalama satiri yoksa sifirda kalir.
+    if current_file_pending:
+        files_seen += 1
     emit_progress(100.0)
 
     return proc.returncode, duration

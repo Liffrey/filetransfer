@@ -224,58 +224,59 @@ QMainWindow, QDialog {{
 }}
 
 QWidget {{
+    font-family: "Segoe UI";
     font-size: 13px;
     color: {tokens['text']};
 }}
 
-QPushButton {{
+QPushButton, QToolButton {{
     background-color: {tokens['button_bg']};
     border: 1px solid {tokens['button_border']};
     border-radius: 5px;
     padding: 6px 14px;
     color: {tokens['button_text']};
 }}
-QPushButton[compact="true"] {{
+QPushButton[compact="true"], QToolButton[compact="true"] {{
     padding: 4px 8px;
 }}
-QPushButton:hover {{
+QPushButton:hover, QToolButton:hover {{
     background-color: {tokens['button_hover_bg']};
     border-color: {ACCENT};
 }}
-QPushButton:pressed {{
+QPushButton:pressed, QToolButton:pressed {{
     background-color: {tokens['button_pressed_bg']};
 }}
-QPushButton:disabled {{
+QPushButton:disabled, QToolButton:disabled {{
     color: {tokens['button_disabled_text']};
     background-color: {tokens['button_disabled_bg']};
     border-color: {tokens['button_disabled_border']};
 }}
 
-QPushButton[primary="true"] {{
+QPushButton[primary="true"], QToolButton[primary="true"] {{
     background-color: {ACCENT};
     border: 1px solid {ACCENT_DARK};
     color: white;
     font-weight: 600;
 }}
-QPushButton[primary="true"]:hover {{
+QPushButton[primary="true"]:hover, QToolButton[primary="true"]:hover {{
     background-color: {ACCENT_DARK};
 }}
-QPushButton[primary="true"]:disabled {{
+QPushButton[primary="true"]:disabled, QToolButton[primary="true"]:disabled {{
     background-color: {tokens['primary_disabled_bg']};
     border-color: {tokens['primary_disabled_border']};
     color: #eef2f8;
 }}
 
-QPushButton[danger="true"] {{
+QPushButton[danger="true"], QToolButton[danger="true"] {{
     background-color: {tokens['danger_bg']};
     border: 1px solid {tokens['danger_border']};
     color: white;
     font-weight: 600;
 }}
-QPushButton[danger="true"]:hover {{
+QPushButton[danger="true"]:hover, QToolButton[danger="true"]:hover {{
     background-color: {tokens['danger_hover_bg']};
 }}
-QPushButton[danger="true"]:disabled {{
+QPushButton[danger="true"]:disabled, QToolButton[danger="true"]:disabled {{
     background-color: {tokens['danger_disabled_bg']};
     border-color: {tokens['danger_disabled_border']};
     color: #fbe3e3;

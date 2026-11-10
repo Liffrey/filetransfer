@@ -105,7 +105,8 @@ class CheckpointJournal:
             "hash": verified_hash,
             "at": time.time(),
         }
-        self.records[rel_path.casefold()] = record
+        if self.resumed:
+            self.records[rel_path.casefold()] = record
         self._append(record)
 
     def finish(self, status: str, verified_count: int, total_count: int, error: str = "") -> None:

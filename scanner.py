@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 
-@dataclass
+@dataclass(slots=True)
 class ScannedFile:
     path: str        # tam yol
     rel_path: str     # kok dizine gore relatif yol
@@ -77,6 +77,8 @@ def scan_directory(
     round-trip'i gerektirir - eski rglob+stat zincirindeki 3-4'e kiyasla.
     """
     root_path = os.path.normpath(root_path)
+    max_workers = max(1, min(128, int(max_workers)))
+    progress_interval = max(1, int(progress_interval))
     root_len = len(root_path.rstrip(os.sep)) + 1  # relpath icin on-hesap
 
     dir_queue: "queue.Queue[str]" = queue.Queue()

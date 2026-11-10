@@ -17,6 +17,7 @@ PowerShell surumunden farklar (kasitli iyilestirmeler):
 from __future__ import annotations
 
 import concurrent.futures
+from collections import deque
 import datetime
 import html
 import hashlib
@@ -29,7 +30,7 @@ import time
 from dataclasses import dataclass
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from engine.config import TransferJob
 from engine.logutil import EngineLogger, DiskInfo, get_disk_info, format_size, HashLogWriter, sanitize_filename
@@ -48,6 +49,7 @@ class SourceFileInfo:
     size: int
     src: str
     rel: str
+    mtime: float
 
 
 @dataclass(slots=True)
@@ -77,6 +79,10 @@ class _PendingVerify:
     dst_path: Optional[str]
 
 
+class _PreDeleteCheckFailed(OSError):
+    pass
+
+
 @dataclass
 class TransferResult:
     job_name: str
@@ -96,6 +102,8 @@ class TransferResult:
     transferred_bytes: int = 0
     duration: str = ""
     dry_run: bool = False
+    delete_failed_files: int = 0
+    delete_directory_failed: int = 0
 
 
 # Robocopy exit kodu bit anlami:
@@ -115,6 +123,7 @@ class TransferResult:
 # kodundan cok daha faydali bir sonuc).
 ROBOCOPY_FATAL_MASK = 16
 ROBOCOPY_FILE_ERROR_BIT = 8
+ROBOCOPY_MISMATCH_BIT = 4
 PREVIEW_RECEIPT_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
@@ -180,6 +189,16 @@ def _preview_signature(job: TransferJob, files: list) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _paths_overlap(source: str, destination: str) -> bool:
+    source_path = os.path.normcase(os.path.realpath(os.path.abspath(source)))
+    destination_path = os.path.normcase(os.path.realpath(os.path.abspath(destination)))
+    try:
+        common_path = os.path.commonpath((source_path, destination_path))
+    except ValueError:
+        return False
+    return common_path in (source_path, destination_path)
+
+
 def _write_preview_receipt(path: Path, signature: str) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -240,6 +259,8 @@ def _render_html_report(summary: dict) -> str:
         ("Dogrulanan", result.get("verified", 0)),
         ("Basarisiz", result.get("failed", 0)),
         ("Eksik", result.get("missing", 0)),
+        ("Silinemeyen dosya", result.get("delete_failed", 0)),
+        ("Silinemeyen klasor", result.get("delete_directory_failed", 0)),
         ("Atlanan", result.get("skipped", 0)),
         ("Aktarilan", format_size(transferred_bytes)),
         ("Ortalama hiz", speed),
@@ -365,19 +386,44 @@ def hash_files_parallel(paths: list[str], max_workers: Optional[int] = None,
     if max_workers is None:
         max_workers = min(32, (os.cpu_count() or 4) * 2)
 
+    max_workers = max(1, min(128, int(max_workers)))
     if len(paths) < min_parallel_count or max_workers <= 1:
         return {p: _sha256_of_file(p) for p in paths}
 
-    results: dict[str, Optional[str]] = {}
+    return dict(zip(paths, _iter_hashes_parallel(paths, max_workers)))
+
+
+def _iter_hashes_parallel(paths, max_workers: int) -> Iterator[Optional[str]]:
+    """Hash files with a bounded queue of futures and preserve input order."""
+    if max_workers <= 1:
+        for path in paths:
+            yield _sha256_of_file(path)
+        return
+
+    path_iter = iter(paths)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_path = {executor.submit(_sha256_of_file, p): p for p in paths}
-        for future in concurrent.futures.as_completed(future_to_path):
-            path = future_to_path[future]
+        pending = deque()
+        max_pending = max_workers * 2
+
+        def submit_next() -> bool:
             try:
-                results[path] = future.result()
+                path = next(path_iter)
+            except StopIteration:
+                return False
+            pending.append(executor.submit(_sha256_of_file, path))
+            return True
+
+        for _ in range(max_pending):
+            if not submit_next():
+                break
+
+        while pending:
+            future = pending.popleft()
+            try:
+                yield future.result()
             except Exception:
-                results[path] = None
-    return results
+                yield None
+            submit_next()
 
 
 def delete_files_parallel(paths: list[str], max_workers: Optional[int] = None,
@@ -386,6 +432,7 @@ def delete_files_parallel(paths: list[str], max_workers: Optional[int] = None,
                            cancel_event: Optional[threading.Event] = None,
                            max_retries: int = 1,
                            logger: Optional[EngineLogger] = None,
+                           pre_delete_check: Optional[Callable[[str], Optional[str]]] = None,
                            ) -> tuple[int, list[tuple[str, str]]]:
     """
     Kaynak dosyalari PARALEL siler. Eski sequential `for v in verified:
@@ -409,9 +456,19 @@ def delete_files_parallel(paths: list[str], max_workers: Optional[int] = None,
         return 0, []
     if max_workers is None:
         max_workers = min(32, (os.cpu_count() or 4) * 4)
+    max_workers = max(1, min(128, int(max_workers)))
+
+    def _cancelled_error(remaining_count: int) -> OSError:
+        return InterruptedError(
+            f"Kullanici tarafindan durduruldu ({remaining_count} dosya bekliyor)"
+        )
 
     def _delete_one(path: str) -> Optional[OSError]:
         try:
+            if pre_delete_check is not None:
+                reason = pre_delete_check(path)
+                if reason:
+                    return _PreDeleteCheckFailed(reason)
             os.remove(path)
             return None
         except FileNotFoundError:
@@ -422,50 +479,101 @@ def delete_files_parallel(paths: list[str], max_workers: Optional[int] = None,
     def _delete_batch(batch: list[str]) -> tuple[int, list[tuple[str, OSError]]]:
         batch_errors: list[tuple[str, OSError]] = []
         batch_success = 0
+        completed = 0
+
+        def report_progress() -> None:
+            if progress_callback and (completed % 5000 == 0 or completed == len(batch)):
+                try:
+                    progress_callback(completed, len(batch))
+                except Exception:
+                    pass
+
         if len(batch) < min_parallel_count or max_workers <= 1:
-            for p in batch:
+            for index, p in enumerate(batch):
                 if cancel_event is not None and cancel_event.is_set():
+                    remaining_count = len(batch) - index
+                    if remaining_count:
+                        batch_errors.append(("", _cancelled_error(remaining_count)))
                     break
                 err = _delete_one(p)
                 if err is None:
                     batch_success += 1
                 else:
                     batch_errors.append((p, err))
+                completed += 1
+                report_progress()
             return batch_success, batch_errors
 
-        done = 0
+        path_iter = iter(batch)
+        futures = {}
+        exhausted = False
+        max_pending = max_workers * 2
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_delete_one, p): p for p in batch}
-            for future in concurrent.futures.as_completed(futures):
-                path = futures[future]
-                err = future.result()
-                if err is None:
-                    batch_success += 1
-                else:
-                    batch_errors.append((path, err))
-                done += 1
-                if progress_callback and done % 5000 == 0:
-                    progress_callback(done, len(batch))
-                if cancel_event is not None and cancel_event.is_set():
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
+            while futures or not exhausted:
+                if cancel_event is not None and cancel_event.is_set() and not exhausted:
+                    remaining_count = sum(1 for _ in path_iter)
+                    if remaining_count:
+                        batch_errors.append(("", _cancelled_error(remaining_count)))
+                    exhausted = True
+
+                while not exhausted and len(futures) < max_pending:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    try:
+                        path = next(path_iter)
+                    except StopIteration:
+                        exhausted = True
+                    else:
+                        futures[executor.submit(_delete_one, path)] = path
+
+                if not futures:
+                    continue
+
+                completed_futures, _ = concurrent.futures.wait(
+                    futures, return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in completed_futures:
+                    path = futures.pop(future)
+                    try:
+                        err = future.result()
+                    except Exception as error:
+                        err = OSError(str(error))
+                    if err is None:
+                        batch_success += 1
+                    else:
+                        batch_errors.append((path, err))
+                    completed += 1
+                    report_progress()
         return batch_success, batch_errors
 
     total_success = 0
-    remaining = list(paths)
+    remaining = paths
     last_errors: list[tuple[str, OSError]] = []
-    attempts = max(1, max_retries)
+    permanent_errors: list[tuple[str, OSError]] = []
+    attempts = max(1, int(max_retries))
+    if cancel_event is not None and cancel_event.is_set():
+        return 0, [("", str(_cancelled_error(len(paths))))]
 
     for attempt in range(1, attempts + 1):
         if not remaining or (cancel_event is not None and cancel_event.is_set()):
             break
         succ, errs = _delete_batch(remaining)
         total_success += succ
-        last_errors = errs
-        if not errs:
+        permanent_errors.extend(
+            (path, error) for path, error in errs
+            if isinstance(error, _PreDeleteCheckFailed)
+        )
+        retryable_errors = [
+            (path, error) for path, error in errs
+            if not isinstance(error, _PreDeleteCheckFailed)
+        ]
+        last_errors = permanent_errors + retryable_errors
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        if not retryable_errors:
             remaining = []
             break
-        remaining = [p for p, _ in errs]
+        remaining = [p for p, _ in retryable_errors]
         if attempt < attempts:
             wait_s = min(2.0 * attempt, 8.0)
             if logger is not None:
@@ -480,7 +588,10 @@ def delete_files_parallel(paths: list[str], max_workers: Optional[int] = None,
     return total_success, [(p, str(e)) for p, e in last_errors]
 
 
-def remove_empty_dirs(root: str) -> tuple[int, list[tuple[str, str]]]:
+def remove_empty_dirs(
+    root: str,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[int, list[tuple[str, str]]]:
     """Kaynak koku haricindeki tum bos klasorleri alttan uste dogru siler."""
     removed = 0
     errors: list[tuple[str, str]] = []
@@ -489,7 +600,11 @@ def remove_empty_dirs(root: str) -> tuple[int, list[tuple[str, str]]]:
         errors.append((error.filename or root, str(error)))
 
     for current_root, dirnames, _ in os.walk(root, topdown=False, onerror=on_walk_error):
+        if cancel_event is not None and cancel_event.is_set():
+            break
         for dirname in dirnames:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             directory = os.path.join(current_root, dirname)
             if os.path.islink(directory):
                 continue
@@ -566,13 +681,14 @@ def _retry_and_reverify_files(
                 last_err = str(e)
                 in_use = _is_file_in_use_error(e)
                 wait_s = min(2.0 * attempt, 8.0)
-                if in_use:
+                if in_use and attempt < max_attempts:
                     logger.warn(
                         f"KULLANIMDA: {item.rel} baska bir islem/uygulama tarafindan kullaniliyor "
                         f"(deneme {attempt}/{max_attempts}) - {wait_s:.0f}sn beklenip tekrar denenecek.",
                         console=True,
                     )
-                time.sleep(wait_s)
+                if attempt < max_attempts and (cancel_event is None or not cancel_event.is_set()):
+                    time.sleep(wait_s)
                 continue
 
             try:
@@ -580,7 +696,8 @@ def _retry_and_reverify_files(
             except OSError as e:
                 last_err = str(e)
                 in_use = _is_file_in_use_error(e)
-                time.sleep(min(2.0 * attempt, 8.0))
+                if attempt < max_attempts and (cancel_event is None or not cancel_event.is_set()):
+                    time.sleep(min(2.0 * attempt, 8.0))
                 continue
             item.size = sz  # her denemede hedefte GERCEKTE ne var onu yansitir (MISSING'den duzelen dosyada 0'da KALMASIN)
 
@@ -618,13 +735,42 @@ def _retry_and_reverify_files(
                        "SUCCESS" if ok else "ERROR", console=False)
         return fixed, still_failed
 
+    pending_items = iter(pending)
+    futures = {}
+    exhausted = False
+    max_pending = max_workers * 2
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_retry_one, item): item for item in pending}
-        for future in concurrent.futures.as_completed(futures):
-            result_item, ok = future.result()
-            (fixed if ok else still_failed).append(result_item)
-            logger.log(f"TEKRAR DENEME {'BASARILI' if ok else 'BASARISIZ'}: {result_item.rel}",
-                       "SUCCESS" if ok else "ERROR", console=False)
+        while futures or not exhausted:
+            if cancel_event is not None and cancel_event.is_set() and not exhausted:
+                still_failed.extend(pending_items)
+                exhausted = True
+
+            while not exhausted and len(futures) < max_pending:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                try:
+                    item = next(pending_items)
+                except StopIteration:
+                    exhausted = True
+                else:
+                    futures[executor.submit(_retry_one, item)] = item
+
+            if not futures:
+                continue
+
+            completed_futures, _ = concurrent.futures.wait(
+                futures, return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in completed_futures:
+                item = futures.pop(future)
+                try:
+                    result_item, ok = future.result()
+                except Exception as error:
+                    result_item, ok = item, False
+                    result_item.dst_hash = f"(tekrar deneme hatasi: {error})"
+                (fixed if ok else still_failed).append(result_item)
+                logger.log(f"TEKRAR DENEME {'BASARILI' if ok else 'BASARISIZ'}: {result_item.rel}",
+                           "SUCCESS" if ok else "ERROR", console=False)
     return fixed, still_failed
 
 
@@ -811,6 +957,8 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 "transferred_bytes": extra.get("transferred_bytes", 0),
                 "duration": extra.get("duration", ""),
                 "elapsed_seconds": elapsed_seconds,
+                "delete_failed": extra.get("delete_failed_files", 0),
+                "delete_directory_failed": extra.get("delete_directory_failed", 0),
             },
             "log_files": {
                 "main_log": str(log_file),
@@ -883,6 +1031,21 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         if not job.source_path or not job.destination_path:
             logger.error("Kaynak/Hedef tanimlanmamis!")
             return result(False, "Yol eksik")
+        if job.verification_mode not in ("FullHash", "SizeOnly", "None"):
+            logger.error(f"Gecersiz dogrulama modu: {job.verification_mode}")
+            return result(False, "Gecersiz dogrulama modu")
+        if job.older_than_days < 0 or job.max_retries < 0:
+            logger.error("Yas filtresi ve tekrar deneme sayisi negatif olamaz.")
+            return result(False, "Gecersiz yas filtresi veya tekrar deneme sayisi")
+        if _paths_overlap(job.source_path, job.destination_path):
+            logger.error("Kaynak ve hedef klasorler ayni veya ic ice olamaz.")
+            return result(False, "Kaynak ve hedef klasorler ayni veya ic ice")
+        if not os.path.isdir(job.source_path):
+            logger.error(f"Kaynak klasor erisilemiyor veya klasor degil: {job.source_path}")
+            return result(False, "Kaynak klasor erisilemiyor veya klasor degil")
+        if os.path.exists(job.destination_path) and not os.path.isdir(job.destination_path):
+            logger.error(f"Hedef bir klasor degil: {job.destination_path}")
+            return result(False, "Hedef bir klasor degil")
 
         # ---- SMB pre-auth ----
         if credential_store and job.credential_alias:
@@ -935,7 +1098,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         cutoff = (today_midnight - datetime.timedelta(days=job.older_than_days)).timestamp()
 
         def scan_progress(scanned: int, matched: int) -> None:
-            logger.info(f"  Taraniyor... {scanned:,} dosya kontrol edildi, {matched:,} eslesti")
+            progress_text = (
+                f"Kaynak taraniyor: {scanned:,} dosya kontrol edildi, {matched:,} eslesti"
+            ).replace(",", ".")
+            logger.info(f"  {progress_text}")
+            if on_stage:
+                on_stage(progress_text)
 
         scan_result = scan_directory(
             job.source_path, file_filter=job.file_filter, mtime_cutoff=cutoff,
@@ -951,7 +1119,6 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         src_files = scan_result.matched
         skipped = scan_result.skipped_count
         logger.info(f"Tarama tamam: Tasinacak={len(src_files)}  Atlanacak(daha yeni)={skipped}")
-        source_mtime_by_rel = {item.rel_path.casefold(): item.mtime for item in src_files}
         if checkpoint_journal is not None and checkpoint_journal.resumed:
             matching_checkpoint_files = checkpoint_journal.matching_count(src_files)
             logger.info(
@@ -960,9 +1127,14 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             )
 
         checkpoint_set = set(checkpoint_files or set())
-        all_src_files_for_plan = list(src_files)
-        current_preview_signature = _preview_signature(job, all_src_files_for_plan)
+        all_src_files_for_plan = src_files
+        current_preview_signature = (
+            _preview_signature(job, all_src_files_for_plan)
+            if job.delete_after_transfer else ""
+        )
         preview_matches = (
+            bool(current_preview_signature)
+            and
             scan_result.error_count == 0
             and _preview_receipt_matches(preview_receipt_path, current_preview_signature)
         )
@@ -1008,6 +1180,12 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             logger.success("Tasinacak dosya yok.")
             return result(True, total_files=0, skipped_files=skipped)
 
+        if on_progress is not None:
+            try:
+                on_progress(RobocopyProgress(files_total=len(src_files)))
+            except Exception:
+                pass
+
         src_total_bytes = sum(f.size for f in src_files)
         logger.info(f"Transfer boyutu: {format_size(src_total_bytes)}")
 
@@ -1019,6 +1197,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
 
         # ---- Kaynak hash/boyut (tarama sirasinda alinan boyut/mtime tekrar KULLANILIR, yeniden stat YOK) ----
         hash_table: dict[str, SourceFileInfo] = {}
+        source_hash_errors = []
 
         if job.verification_mode != "None":
             logger.header("-" * 64)
@@ -1028,17 +1207,38 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             t0 = time.time()
 
             if job.verification_mode == "FullHash":
-                path_strs = [f.path for f in src_files]
-                hash_map = hash_files_parallel(path_strs, max_workers=job.robocopy_threads)
-                for f in src_files:
-                    h = hash_map.get(f.path)
+                hash_results = _iter_hashes_parallel(
+                    (f.path for f in src_files),
+                    max(1, min(128, job.robocopy_threads)),
+                )
+                progress_interval = max(1000, len(src_files) // 100)
+                last_progress = 0
+                for index, (f, h) in enumerate(zip(src_files, hash_results), start=1):
+                    if cancel_event is not None and cancel_event.is_set():
+                        return result(False, "Kullanici tarafindan durduruldu", total_files=len(src_files))
                     if h:
-                        hash_table[f.rel_path.lower()] = SourceFileInfo(hash=h, size=f.size, src=f.path, rel=f.rel_path)
+                        hash_table[f.rel_path.lower()] = SourceFileInfo(
+                            hash=h, size=f.size, src=f.path, rel=f.rel_path, mtime=f.mtime,
+                        )
                     else:
                         logger.warn(f"Hash alinamadi: {f.path}", console=False)
+                        source_hash_errors.append(f)
+                    if index - last_progress >= progress_interval or index == len(src_files):
+                        last_progress = index
+                        progress_text = f"Kaynak analizi: {index:,}/{len(src_files):,} dosya".replace(",", ".")
+                        logger.info(f"  {progress_text}")
+                        if on_stage:
+                            on_stage(progress_text)
             else:  # SizeOnly - boyut zaten tarama sirasinda alindi, ekstra islem gerekmez
-                for f in src_files:
-                    hash_table[f.rel_path.lower()] = SourceFileInfo(hash=f"SIZE:{f.size}", size=f.size, src=f.path, rel=f.rel_path)
+                for index, f in enumerate(src_files, start=1):
+                    if index % 1000 == 0 and cancel_event is not None and cancel_event.is_set():
+                        return result(False, "Kullanici tarafindan durduruldu", total_files=len(src_files))
+                    hash_table[f.rel_path.lower()] = SourceFileInfo(
+                        hash=f"SIZE:{f.size}", size=f.size, src=f.path, rel=f.rel_path, mtime=f.mtime,
+                    )
+
+            if cancel_event is not None and cancel_event.is_set():
+                return result(False, "Kullanici tarafindan durduruldu", total_files=len(src_files))
 
             logger.success(f"Kaynak analizi tamam: {len(hash_table)}/{len(src_files)}  ({time.time()-t0:.1f}sn)")
         else:
@@ -1061,6 +1261,9 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
         if exit_code == -1:
             logger.warn("Robocopy kullanici tarafindan DURDURULDU.")
             return result(False, "Kullanici tarafindan durduruldu")
+        if cancel_event is not None and cancel_event.is_set():
+            logger.warn("Transfer kullanici tarafindan DURDURULDU; dogrulama/silme baslatilmadi.")
+            return result(False, "Kullanici tarafindan durduruldu", total_files=len(src_files), robocopy_exit=exit_code)
 
         desc = _robocopy_exit_description(exit_code)
         robo_fatal = (exit_code & ROBOCOPY_FATAL_MASK) != 0
@@ -1104,13 +1307,14 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
 
         if job.verification_mode == "None":
             total = len(src_files)
-            verified_count = total
+            verified_count = 0
             failed_count = missing_count = 0
-            transferred_bytes = src_total_bytes
+            transferred_bytes = 0
+            logger.warn("Dosya dogrulamasi kapali; dogrulanan dosya ve aktarilan byte sayisi raporlanmayacak.")
             # FATAL bayragi varsa, dogrulama YAPILMADIGI icin (bu mod zaten
             # dogrulama atliyor) gercekte ne kadarinin basarili oldugunu
             # BILEMIYORUZ - guvenli tarafta kalip basarisiz raporlaniyor.
-            job_ok = not robo_fatal
+            job_ok = not bool(exit_code & (ROBOCOPY_MISMATCH_BIT | ROBOCOPY_FILE_ERROR_BIT | ROBOCOPY_FATAL_MASK))
         else:
             logger.header("-" * 64)
             stage("Hedef taraniyor (dogrulama)")
@@ -1120,10 +1324,21 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             # Hedefi TEK GECISTE tara (dosya basina ayri exists()/stat() cagrisi YOK).
             # Bu, kaynak taramasindaki ayni performans duzeltmesinin hedefe uygulanmis hali.
             logger.info("Hedef dizin taraniyor (dogrulama icin)...")
+
+            def target_scan_progress(scanned: int, matched: int) -> None:
+                progress_text = f"Hedef taraniyor: {scanned:,} dosya kontrol edildi".replace(",", ".")
+                logger.info(f"  {progress_text}")
+                if on_stage:
+                    on_stage(progress_text)
+
             dst_scan = scan_directory(
                 job.destination_path, file_filter=job.file_filter, mtime_cutoff=None,
-                max_workers=job.robocopy_threads, cancel_event=cancel_event,
+                max_workers=job.robocopy_threads, progress_callback=target_scan_progress,
+                cancel_event=cancel_event,
             )
+            if dst_scan.cancelled or (cancel_event is not None and cancel_event.is_set()):
+                logger.warn("Hedef tarama kullanici tarafindan DURDURULDU; kaynak dosyalar silinmedi.")
+                return result(False, "Kullanici tarafindan durduruldu", total_files=len(src_files))
             dst_index = build_rel_index(dst_scan.matched)
             logger.info(f"Hedef tarama tamam: {len(dst_index)} dosya bulundu.")
             stage("Dogrulama yapiliyor")
@@ -1140,26 +1355,36 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 # icin cift satir (once MISMATCH, sonra tekrar OK) OLUSMAZ;
                 # her dosya icin TEK ve NIHAI sonuc yazilir.
                 pending_negative: list[_PendingVerify] = []
+                for item in source_hash_errors:
+                    failed.append(FailedFileInfo(
+                        rel=item.rel_path, src_hash="(okunamadi)", dst_hash="-",
+                    ))
+                    hlw.add_entry(item.rel_path, "(okunamadi)", "-", item.size, "ERROR")
+
                 if job.verification_mode == "FullHash":
-                    dst_paths = []
-                    rel_map = {}
                     for rel_key, info in hash_table.items():
-                        dst_entry = dst_index.get(rel_key)
-                        if dst_entry is not None:
-                            dst_paths.append(dst_entry.path)
-                            rel_map[dst_entry.path] = rel_key
-                        else:
+                        if rel_key not in dst_index:
                             logger.warn(f"EKSIK: {info.rel}", console=False)
                             missing.append(info.rel)
                             pending_negative.append(_PendingVerify(info.rel, info.hash, "-", 0, "MISSING", None))
 
-                    dst_hash_map = hash_files_parallel(dst_paths, max_workers=job.robocopy_threads) if dst_paths else {}
+                    def present_target_entries():
+                        for rel_key, info in hash_table.items():
+                            dst_entry = dst_index.get(rel_key)
+                            if dst_entry is not None:
+                                yield rel_key, info, dst_entry
 
-                    for dst_path in dst_paths:
-                        rel_key = rel_map[dst_path]
-                        info = hash_table[rel_key]
-                        dh = dst_hash_map.get(dst_path)
-                        sz = dst_index[rel_key].size  # taramadan geldi, ekstra stat() YOK
+                    present_entries = present_target_entries()
+                    destination_hashes = _iter_hashes_parallel(
+                        (entry.path for _, _, entry in present_target_entries()),
+                        max(1, min(128, job.robocopy_threads)),
+                    )
+                    for (rel_key, info, dst_entry), dh in zip(present_entries, destination_hashes):
+                        if cancel_event is not None and cancel_event.is_set():
+                            logger.warn("Dogrulama kullanici tarafindan DURDURULDU; kaynak dosyalar silinmedi.")
+                            return result(False, "Kullanici tarafindan durduruldu", total_files=len(src_files))
+                        dst_path = dst_entry.path
+                        sz = dst_entry.size  # taramadan geldi, ekstra stat() YOK
 
                         if dh is None:
                             logger.error(f"HASH ALINAMADI: {info.rel}", console=False)
@@ -1169,7 +1394,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                             verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_path))
                             hlw.add_entry(info.rel, info.hash, dh, sz, "OK")
                             record_verified_checkpoint(
-                                info.rel, info.size, source_mtime_by_rel.get(rel_key, 0.0),
+                                info.rel, info.size, info.mtime,
                                 "FullHash", info.hash,
                             )
                         else:
@@ -1177,7 +1402,10 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                             failed.append(FailedFileInfo(rel=info.rel, src_hash=info.hash, dst_hash=dh))
                             pending_negative.append(_PendingVerify(info.rel, info.hash, dh, sz, "MISMATCH", dst_path))
                 else:  # SizeOnly - boyut karsilastirmasi tamamen bellek-ici, sifir ekstra I/O
-                    for rel_key, info in hash_table.items():
+                    for index, (rel_key, info) in enumerate(hash_table.items(), start=1):
+                        if index % 1000 == 0 and cancel_event is not None and cancel_event.is_set():
+                            logger.warn("Dogrulama kullanici tarafindan DURDURULDU; kaynak dosyalar silinmedi.")
+                            return result(False, "Kullanici tarafindan durduruldu", total_files=len(src_files))
                         dst_entry = dst_index.get(rel_key)
                         src_hash_label = f"(boyut:{format_size(info.size)})"
                         if dst_entry is None:
@@ -1190,7 +1418,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                             verified.append(VerifiedFileInfo(rel=info.rel, size=sz, src_file=info.src, dst_file=dst_entry.path))
                             hlw.add_entry(info.rel, src_hash_label, f"(boyut:{format_size(sz)})", sz, "OK")
                             record_verified_checkpoint(
-                                info.rel, info.size, source_mtime_by_rel.get(rel_key, 0.0),
+                                info.rel, info.size, info.mtime,
                                 "SizeOnly",
                             )
                         else:
@@ -1209,6 +1437,9 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                     stage("Hatali/eksik dosyalar tekrar deneniyor")
                     logger.warn(f"{len(pending_negative)} dosya ilk denemede basarisiz/eksik cikti - kopyalama tekrar denenip yeniden dogrulanacak...")
                     fixed, still_bad = _retry_and_reverify_files(job, hash_table, pending_negative, logger, cancel_event)
+                    if cancel_event is not None and cancel_event.is_set():
+                        logger.warn("Tekrar deneme kullanici tarafindan DURDURULDU; kaynak dosyalar silinmedi.")
+                        return result(False, "Kullanici tarafindan durduruldu", total_files=len(src_files))
                     fixed_rels = {f.rel for f in fixed}
                     failed = [f for f in failed if f.rel not in fixed_rels]
                     missing = [m for m in missing if m not in fixed_rels]
@@ -1217,7 +1448,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                         verified.append(VerifiedFileInfo(rel=f.rel, size=f.size, src_file=src_info.src, dst_file=f.dst_path))
                         hlw.add_entry(f.rel, f.src_hash, f.dst_hash, f.size, "OK")
                         record_verified_checkpoint(
-                            f.rel, src_info.size, source_mtime_by_rel.get(f.rel.casefold(), 0.0),
+                            f.rel, src_info.size, src_info.mtime,
                             job.verification_mode, src_info.hash if job.verification_mode == "FullHash" else "",
                         )
                     for f in still_bad:
@@ -1254,6 +1485,7 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 send_alert_mail(job.smtp_server, job.mail_from, job.mail_to,
                                  f"[KRITIK] {job.name} - Transfer sonrasi disk", f"Hedef: {job.destination_path}", logger)
 
+        verification_job_ok = job_ok
         if job_ok:
             logger.success("TUM DOSYALAR DOGRULANDI.")
         elif robo_fatal and failed_count == 0 and missing_count == 0:
@@ -1285,7 +1517,15 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
             except Exception:
                 pass
 
+        if cancel_event is not None and cancel_event.is_set():
+            logger.warn("Transfer kullanici tarafindan DURDURULDU; kaynak dosyalar silinmedi.")
+            return result(False, "Kullanici tarafindan durduruldu", total_files=total,
+                          verified_files=verified_count, failed_files=failed_count,
+                          missing_files=missing_count, transferred_bytes=transferred_bytes)
+
         # ---- Silme ----
+        delete_failed_count = 0
+        delete_directory_failed_count = 0
         if job.delete_after_transfer:
             deletion_allowed, deletion_reason = _deletion_guard(job, preview_matches)
             if not deletion_allowed:
@@ -1296,6 +1536,29 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 stage("Kaynak dosyalar siliniyor")
                 logger.warn(f"Kaynak dosyalar siliniyor... ({len(verified)} dogrulanmis dosya)")
                 verified_paths = [item.src_file for item in verified]
+                verified_by_path = {item.src_file: item for item in verified}
+                source_info_by_path = {info.src: info for info in hash_table.values()}
+
+                def check_before_delete(path: str) -> Optional[str]:
+                    info = source_info_by_path.get(path)
+                    verified_item = verified_by_path.get(path)
+                    if info is None or verified_item is None:
+                        return "Silme oncesi dogrulama kaydi bulunamadi"
+                    try:
+                        source_stat = os.stat(path)
+                    except FileNotFoundError:
+                        return None
+                    except OSError as error:
+                        return f"Kaynak silme oncesi kontrol edilemedi: {error}"
+                    if source_stat.st_size != info.size or source_stat.st_mtime != info.mtime:
+                        return "Kaynak dosya dogrulamadan sonra degisti; silinmedi"
+                    try:
+                        destination_stat = os.stat(verified_item.dst_file)
+                    except OSError as error:
+                        return f"Dogrulanmis hedef artik erisilemiyor; kaynak korunuyor: {error}"
+                    if destination_stat.st_size != info.size:
+                        return "Dogrulanmis hedef boyutu degisti; kaynak silinmedi"
+                    return None
 
                 def on_delete_progress(done, tot):
                     emit_delete_progress(done, tot, "Kaynak dosyalar siliniyor")
@@ -1308,24 +1571,38 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                     cancel_event=cancel_event,
                     max_retries=job.max_retries,
                     logger=logger,
+                    pre_delete_check=check_before_delete,
                 )
                 for path, error in del_errors:
-                    logger.error(f"Silinemedi: {path} — {error}", console=False)
+                    if path:
+                        logger.error(f"Silinemedi: {path} — {error}", console=False)
+                    else:
+                        logger.warn(error)
+                delete_failed_count = sum(1 for path, _ in del_errors if path)
                 if not del_errors:
                     logger.success(f"Dogrulanan {del_ok} kaynak dosya silindi.")
+                elif cancel_event is not None and cancel_event.is_set():
+                    logger.warn(f"Silme iptal edildi; {del_ok} kaynak dosya silindi.")
                 else:
                     logger.warn(f"{del_ok} dosya silindi, {len(del_errors)} dosya silinemedi (detay: log dosyasi).")
-                dirs_removed, dir_errors = remove_empty_dirs(job.source_path)
-                if dirs_removed:
-                    logger.info(f"Bos kalan {dirs_removed} kaynak klasoru de silindi.")
-                for directory, error in dir_errors:
-                    logger.warn(f"Bos klasor silinemedi: {directory} — {error}", console=False)
+                if cancel_event is None or not cancel_event.is_set():
+                    dirs_removed, dir_errors = remove_empty_dirs(job.source_path, cancel_event)
+                    delete_directory_failed_count = len(dir_errors)
+                    if dirs_removed:
+                        logger.info(f"Bos kalan {dirs_removed} kaynak klasoru de silindi.")
+                    for directory, error in dir_errors:
+                        logger.warn(f"Bos klasor silinemedi: {directory} — {error}", console=False)
 
-            if failed or missing:
-                logger.error(
-                    f"{len(failed) + len(missing)} dosya tekrar denemeye ragmen basarisiz/eksik kaldi — "
-                    f"BU DOSYALAR KAYNAKTA KORUNDU (silinmedi). Detaylar hash logunda: {hash_log_file}"
-                )
+        if cancel_event is not None and cancel_event.is_set():
+            job_ok = False
+        elif delete_failed_count or delete_directory_failed_count:
+            job_ok = False
+
+        if failed or missing:
+            logger.error(
+                f"{len(failed) + len(missing)} dosya tekrar denemeye ragmen basarisiz/eksik kaldi — "
+                f"BU DOSYALAR KAYNAKTA KORUNDU (silinmedi). Detaylar hash logunda: {hash_log_file}"
+            )
 
         # ---- JSON ve HTML rapor ozeti ----
         summary = {
@@ -1341,6 +1618,8 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                 "total": total, "verified": verified_count, "failed": failed_count,
                 "missing": missing_count, "skipped": skipped,
                 "transferred_bytes": transferred_bytes, "duration": str(duration),
+                "delete_failed": delete_failed_count,
+                "delete_directory_failed": delete_directory_failed_count,
             },
             "log_files": {
                 "main_log": str(log_file),
@@ -1357,23 +1636,57 @@ def run_transfer(job: TransferJob, run_id: Optional[str] = None,
                     "SUCCESS" if job_ok else "ERROR")
 
         final_error = ""
-        if not job_ok:
-            if robo_fatal and failed_count == 0 and missing_count == 0:
+        if cancel_event is not None and cancel_event.is_set():
+            final_error = "Kullanici tarafindan durduruldu"
+        else:
+            if not verification_job_ok and job.verification_mode == "None":
+                final_error = f"Robocopy dogrulamasiz modda hata bildirdi (Exit={exit_code})"
+            elif not verification_job_ok and robo_fatal and failed_count == 0 and missing_count == 0:
                 final_error = f"Robocopy FATAL bildirdi (Exit={exit_code}), ancak dogrulanan {verified_count} dosya tutarli"
-            elif robo_fatal:
+            elif not verification_job_ok and robo_fatal:
                 final_error = f"Robocopy FATAL bildirdi (Exit={exit_code}) + dogrulamada Basarisiz={failed_count} Eksik={missing_count}"
-            else:
+            elif not verification_job_ok:
                 final_error = f"Dogrulama: Basarisiz={failed_count} Eksik={missing_count}"
+        if delete_failed_count:
+            message = f"Kaynak dosyalari silinemedi: {delete_failed_count}"
+            final_error = f"{final_error}; {message}" if final_error else message
+        if delete_directory_failed_count:
+            message = f"Kaynak klasorleri silinemedi: {delete_directory_failed_count}"
+            final_error = f"{final_error}; {message}" if final_error else message
 
         summary["result"]["error_message"] = final_error
         report_data.update(summary)
         return result(
             job_ok, final_error, total_files=total, verified_files=verified_count,
             failed_files=failed_count, missing_files=missing_count,
+            delete_failed_files=delete_failed_count,
+            delete_directory_failed=delete_directory_failed_count,
             skipped_files=skipped, transferred_bytes=transferred_bytes,
             duration=str(duration),
         )
 
+    except Exception as error:
+        error_message = f"Beklenmeyen aktarim hatasi: {type(error).__name__}: {error}"
+        try:
+            logger.error(error_message)
+        except Exception:
+            pass
+        if checkpoint_journal is not None:
+            try:
+                checkpoint_journal.finish("failed", 0, 0, error_message)
+            except OSError:
+                pass
+        return TransferResult(
+            job_name=job.name,
+            overall_success=False,
+            error_message=error_message,
+            log_file=str(log_file),
+            robocopy_log=str(robocopy_log),
+            hash_log_file=str(hash_log_file) if hash_log_created else "",
+            summary_json=str(summary_json),
+            report_file=str(report_html),
+            run_id=run_id,
+        )
     finally:
         if checkpoint_journal is not None:
             try:

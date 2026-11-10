@@ -26,11 +26,11 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QCoreApplication, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QTextCursor, QTextCharFormat
+from PySide6.QtGui import QAction, QColor, QIcon, QTextCursor, QTextCharFormat
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QSplitter, QPlainTextEdit, QMessageBox,
-    QStatusBar, QHeaderView, QFrame, QLabel, QProgressBar, QInputDialog, QLineEdit,
+    QStatusBar, QHeaderView, QFrame, QLabel, QInputDialog, QLineEdit,
     QDialog, QMenu, QToolButton,
 )
 
@@ -56,18 +56,27 @@ from gui.style import (
 from resources import get_app_icon_path
 
 
-COLUMNS = ["Job Adi", "Kaynak", "Hedef", "Yas(gun)", "Sil", "Aktif", "Zamanlama", "Son Calisma", "Durum", "Rapor", "Log", "Hash Log"]
+COLUMNS = ["Öncelik", "İş", "Kaynak", "Hedef", "Yaş (gün)", "Kaynak Silme", "Etkin", "Zamanlama", "Son Çalıştırma", "Durum", "Rapor", "Günlük", "Doğrulama Günlüğü"]
 REPORT_COL = COLUMNS.index("Rapor")
-LOG_COL = COLUMNS.index("Log")
-HASH_LOG_COL = COLUMNS.index("Hash Log")
+LOG_COL = COLUMNS.index("Günlük")
+HASH_LOG_COL = COLUMNS.index("Doğrulama Günlüğü")
+PRIORITY_COL = COLUMNS.index("Öncelik")
+
+
+class PriorityTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        try:
+            return int(self.text()) < int(other.text())
+        except ValueError:
+            return super().__lt__(other)
 
 # "Hakkinda" penceresinde gosterilecek metin - burayi diledigin gibi duzenleyebilirsin.
 ABOUT_TEXT = """Transfer Console
 
 Dosya aktarimi, butunluk dogrulamasi ve raporlama araci
 
-Surum 2.0.0
-14 Ekim 2026
+Surum 2.0.1
+22 Ekim 2026
 
 Robocopy tabanli aktarim
 SHA-256 veya dosya boyutu ile dogrulama
@@ -77,7 +86,7 @@ Oncelik tabanli, FIFO baglayicili job kuyrugu
 Dry-run onizlemesi ve dogrulanmis silme korumalari
 """
 
-TASK_COLUMNS = ["Job", "Durum", "Asama", "Ilerleme", "Sure", ""]
+TASK_COLUMNS = ["İş", "Durum", "Aşama", "Kopyalanan / Toplam", "Süre", ""]
 TASK_JOB_COL, TASK_STATUS_COL, TASK_STAGE_COL, TASK_PROGRESS_COL, TASK_DURATION_COL, TASK_CLOSE_COL = range(len(TASK_COLUMNS))
 MAX_CONCURRENT_JOBS = 2
 
@@ -113,16 +122,13 @@ def _format_eta(seconds: float) -> str:
 
 
 def compute_task_progress(files_done: int, files_total: int, elapsed_seconds: float = 0.0) -> tuple[int, str]:
-    """Calisma ilerlemesini % ve okunakli 'X/Y dosya (p%) ~ETA' metnini donusturur."""
+    """Döndürülen etiket, kopyalanan dosya sayısını toplam dosyayla gösterir."""
     done = min(max(0, int(files_done)), max(0, int(files_total))) if files_total else max(0, int(files_done))
     total = max(0, int(files_total))
     if total <= 0:
-        return 0, "0%"
+        return 0, "0 / 0 dosya"
     percent = min(100, max(0, round((done / total) * 100)))
-    label = f"{done}/{total} dosya ({percent}%)"
-    if elapsed_seconds > 0 and done > 0 and done < total:
-        eta = elapsed_seconds * (total - done) / done
-        label += f" • ~{_format_eta(eta)} kaldı"
+    label = f"{done:,} / {total:,} dosya".replace(",", ".")
     return percent, label
 
 
@@ -148,12 +154,22 @@ class TransferWorker(QThread):
         self.file_update.emit(p.files_done, p.files_total, p.current_file)
 
     def run(self):
-        result = run_transfer(
-            self.job, run_id=self.run_id, credential_store=self.cred_store,
-            on_log=self.log_line.emit, cancel_event=self.cancel_event,
-            lock_dir=self.lock_dir, on_progress=self._on_progress,
-            on_stage=self.stage_update.emit,
-        )
+        try:
+            result = run_transfer(
+                self.job, run_id=self.run_id, credential_store=self.cred_store,
+                on_log=self.log_line.emit, cancel_event=self.cancel_event,
+                lock_dir=self.lock_dir, on_progress=self._on_progress,
+                on_stage=self.stage_update.emit,
+            )
+        except Exception as error:
+            message = f"Beklenmeyen aktarim hatasi: {type(error).__name__}: {error}"
+            self.log_line.emit(f"[ERROR] {message}")
+            result = TransferResult(
+                job_name=self.job.name,
+                overall_success=False,
+                error_message=message,
+                run_id=self.run_id,
+            )
         self.finished_result.emit(result)
 
     def request_stop(self):
@@ -185,8 +201,15 @@ class MainWindow(QMainWindow):
         self.settings = settings or QSettings("DataTransferTool", "TransferConsole")
         self.theme = self._normalize_theme(initial_theme)
 
-        self.setWindowTitle(f"Veri Transfer Konsolu — {os.environ.get('COMPUTERNAME', 'localhost')}")
-        self.resize(1100, 720)
+        screen = self.screen()
+        available = screen.availableGeometry() if screen is not None else None
+        window_width = min(1450, available.width() - 24) if available else 1450
+        window_height = min(760, available.height() - 60) if available else 760
+        window_width = max(640, window_width)
+        window_height = max(520, window_height)
+        self.setWindowTitle(f"Dosya Aktarım Konsolu — {os.environ.get('COMPUTERNAME', 'localhost')}")
+        self.resize(window_width, window_height)
+        self.setMinimumSize(min(640, window_width), min(520, window_height))
 
         icon_path = get_app_icon_path()
         if icon_path is not None:
@@ -208,6 +231,7 @@ class MainWindow(QMainWindow):
         # OTOMATIK silinmez, kullanici '✕' ile elle kapatir.
         self.tasks: dict[str, JobTaskState] = {}
         self._tasks_panel_hidden = False
+        self._splitter_user_resized = False
 
         # Her job'un KENDI CLI logu ayri tutulur (job'lar arasi karismasin
         # diye) - tabloda hangi job SECILIYSE onun logu gosterilir.
@@ -233,52 +257,74 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
 
-        toolbar_container = QWidget()
-        toolbar_layout = QVBoxLayout(toolbar_container)
+        self.toolbar_container = QWidget()
+        toolbar_layout = QVBoxLayout(self.toolbar_container)
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
         toolbar_layout.setSpacing(4)
 
-        # Ana job ve transfer islemleri ilk satirda, yardimci araclar ikinci satirda.
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
+        toolbar.setContentsMargins(0, 0, 0, 0)
 
-        self.btn_new = QPushButton("+ Yeni Job")
+        self.btn_new = QPushButton("Yeni İş")
         self.btn_new.setProperty("primary", True)
-        self.btn_edit = QPushButton("Duzenle")
+        self.btn_new.setToolTip("Yeni transfer işi oluştur")
+        self.btn_edit = QPushButton("Düzenle")
+        self.btn_edit.setToolTip("Seçili işi düzenle")
         self.btn_delete = QPushButton("Sil")
+        self.btn_delete.setToolTip("Seçili işi sil")
 
-        self.btn_run = QPushButton("▶ Kuyruga Ekle")
+        self.btn_run = QToolButton()
+        self.btn_run.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.btn_run.setProperty("primary", True)
-        self.btn_run.setToolTip("Seçili işi önceliğine göre kuyruğa ekler. En fazla iki iş aynı anda çalışır.")
-        self.btn_dry_run = QPushButton("Onizleme")
-        self.btn_dry_run.setToolTip("Seçili işi kopyalama ve silme yapmadan önizler.")
-        self.btn_resume = QPushButton("Devam Et")
-        self.btn_resume.setToolTip("Uyumlu checkpoint'i yükler; Robocopy /Z ile devam eder ve dosyaları yeniden doğrular.")
-        self.btn_priority = QPushButton("Oncelik")
-        self.btn_priority.setToolTip("Kuyruk sırasını etkiler; eşit öncelikte eklenme sırası korunur.")
-        self.btn_stop = QPushButton("■ Durdur")
+        self.btn_run.setToolTip("Seçili işi başlat. Ok menüsünde önizleme ve devam seçenekleri bulunur.")
+        self.run_menu = QMenu(self.btn_run)
+        self.action_run = QAction("Başlat", self)
+        self.action_dry_run = QAction("Önizleme", self)
+        self.action_resume = QAction("Checkpoint'ten Devam", self)
+        self.run_menu.addAction(self.action_run)
+        self.run_menu.addSeparator()
+        self.run_menu.addAction(self.action_dry_run)
+        self.run_menu.addAction(self.action_resume)
+        self.btn_run.setDefaultAction(self.action_run)
+        self.btn_run.setMenu(self.run_menu)
+        self.btn_stop = QPushButton("Durdur")
         self.btn_stop.setProperty("danger", True)
         self.btn_stop.setEnabled(False)
         for button in (
-            self.btn_new, self.btn_edit, self.btn_delete, self.btn_run,
-            self.btn_dry_run, self.btn_resume, self.btn_stop, self.btn_priority,
+            self.btn_new, self.btn_edit, self.btn_delete, self.btn_run, self.btn_stop,
         ):
             button.setProperty("compact", True)
+            button.setMinimumHeight(32)
+            button.setMinimumWidth(button.sizeHint().width())
+
+        run_label_width = self.btn_run.fontMetrics().horizontalAdvance("Başlat")
+        self.btn_run.setMinimumWidth(max(self.btn_run.minimumWidth(), run_label_width + 40))
+        self.btn_stop.setMinimumWidth(max(
+            self.btn_stop.minimumWidth(),
+            self.btn_stop.fontMetrics().horizontalAdvance("Durdur") + 24,
+        ))
 
         self.btn_theme = QPushButton()
         self.btn_theme.setCheckable(True)
+        theme_label_width = max(
+            self.btn_theme.fontMetrics().horizontalAdvance(label)
+            for label in ("Koyu Tema", "Açık Tema")
+        )
+        self.btn_theme.setMinimumWidth(theme_label_width + 24)
 
-        self.btn_refresh = QPushButton("⟳ Yenile")
+        self.btn_refresh = QPushButton("Yenile")
+        self.btn_refresh.setToolTip("İş listesini yeniden yükle")
         self.btn_tools = QToolButton()
         self.btn_tools.setText("Araçlar")
         self.btn_tools.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.tools_menu = QMenu(self.btn_tools)
         self.tools_menu.addAction("Zamanla", self._on_schedule)
-        self.tools_menu.addAction("Zamanlamayi Kaldir", self._on_unschedule)
+        self.tools_menu.addAction("Zamanlamayı Kaldır", self._on_unschedule)
         self.tools_menu.addSeparator()
-        self.tools_menu.addAction("Kimlik Yoneticisi", self._on_cred_manager)
-        self.tools_menu.addAction("Config Dosyasini Ac", self._on_open_config)
-        self.tools_menu.addAction("Log Klasorunu Ac", self._on_open_logs_folder)
+        self.tools_menu.addAction("Kimlik Yöneticisi", self._on_cred_manager)
+        self.tools_menu.addAction("Yapılandırma Dosyasını Aç", self._on_open_config)
+        self.tools_menu.addAction("Günlük Klasörünü Aç", self._on_open_logs_folder)
         self.tools_menu.addAction("Hakkinda", self._on_about)
         self.btn_tools.setMenu(self.tools_menu)
         self.btn_tools.setToolTip("Zamanlama, kimlik bilgileri ve dosya araçları")
@@ -289,29 +335,30 @@ class MainWindow(QMainWindow):
             line.setFrameShadow(QFrame.Shadow.Sunken)
             layout.addWidget(line)
 
-        for b in (self.btn_new, self.btn_edit, self.btn_delete):
-            toolbar.addWidget(b)
+        for button in (self.btn_new, self.btn_edit, self.btn_delete):
+            toolbar.addWidget(button)
         add_separator(toolbar)
-        for b in (self.btn_run, self.btn_dry_run, self.btn_resume, self.btn_stop, self.btn_priority):
-            if b is not self.btn_priority:
-                toolbar.addWidget(b)
+        toolbar.addWidget(self.btn_run)
+        toolbar.addWidget(self.btn_stop)
         toolbar.addStretch(1)
 
         utility_toolbar = QHBoxLayout()
+        utility_toolbar.setContentsMargins(0, 0, 0, 0)
         utility_toolbar.setSpacing(6)
-        utility_toolbar.addWidget(self.btn_priority)
-        utility_toolbar.addWidget(self.btn_refresh)
-        utility_toolbar.addWidget(self.btn_tools)
-        utility_toolbar.addWidget(self.btn_theme)
+        for button in (self.btn_refresh, self.btn_tools, self.btn_theme):
+            button.setProperty("compact", True)
+            button.setMinimumHeight(30)
+            button.setMinimumWidth(button.sizeHint().width())
+            utility_toolbar.addWidget(button)
         utility_toolbar.addStretch(1)
-
         toolbar_layout.addLayout(toolbar)
         toolbar_layout.addLayout(utility_toolbar)
-        outer.addWidget(toolbar_container)
+        outer.addWidget(self.toolbar_container)
 
         # Splitter: ust=grid, alt=log
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        outer.addWidget(splitter, 1)
+        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.main_splitter.splitterMoved.connect(self._on_splitter_moved)
+        outer.addWidget(self.main_splitter, 1)
 
         table_container = QWidget()
         table_layout = QVBoxLayout(table_container)
@@ -327,9 +374,11 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(32)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(PRIORITY_COL, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(REPORT_COL, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(LOG_COL, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(HASH_LOG_COL, QHeaderView.ResizeMode.ResizeToContents)
@@ -337,12 +386,12 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         table_layout.addWidget(self.table)
 
-        self.empty_label = QLabel("Henuz job yok. Baslamak icin '+ Yeni Job' butonuna tiklayin.")
+        self.empty_label = QLabel("Henüz iş yok. Başlamak için “+ Yeni İş” düğmesini kullanın.")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_label.setVisible(False)
         table_layout.addWidget(self.empty_label)
 
-        splitter.addWidget(table_container)
+        self.main_splitter.addWidget(table_container)
 
         log_container = QWidget()
         log_layout = QVBoxLayout(log_container)
@@ -358,7 +407,7 @@ class MainWindow(QMainWindow):
         # tum paneli elle acip kapatabilir.
         tasks_header = QHBoxLayout()
         tasks_header.setContentsMargins(0, 0, 0, 0)
-        tasks_title = QLabel("Gorevler")
+        tasks_title = QLabel("Görevler")
         tasks_title.setStyleSheet("font-weight: bold;")
         tasks_header.addWidget(tasks_title)
         tasks_header.addStretch(1)
@@ -378,6 +427,8 @@ class MainWindow(QMainWindow):
         self.tasks_table.verticalHeader().setDefaultSectionSize(26)
         self.tasks_table.horizontalHeader().setSectionResizeMode(TASK_JOB_COL, QHeaderView.ResizeMode.ResizeToContents)
         self.tasks_table.horizontalHeader().setSectionResizeMode(TASK_STAGE_COL, QHeaderView.ResizeMode.Stretch)
+        self.tasks_table.horizontalHeader().setSectionResizeMode(TASK_PROGRESS_COL, QHeaderView.ResizeMode.ResizeToContents)
+        self.tasks_table.horizontalHeader().setSectionResizeMode(TASK_DURATION_COL, QHeaderView.ResizeMode.ResizeToContents)
         self.tasks_table.horizontalHeader().setSectionResizeMode(TASK_CLOSE_COL, QHeaderView.ResizeMode.ResizeToContents)
         self.tasks_table.setMaximumHeight(160)
         self.tasks_table.setVisible(False)  # hic gorev yokken yer kaplamasin
@@ -388,8 +439,8 @@ class MainWindow(QMainWindow):
         self.log_view.setMaximumBlockCount(5000)  # sinirsiz buyumeyi engeller
         log_layout.addWidget(self.log_view)
 
-        splitter.addWidget(log_container)
-        splitter.setSizes([380, 300])
+        self.main_splitter.addWidget(log_container)
+        self.main_splitter.setSizes([380, 300])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -398,10 +449,9 @@ class MainWindow(QMainWindow):
         self.btn_new.clicked.connect(self._on_new)
         self.btn_edit.clicked.connect(self._on_edit)
         self.btn_delete.clicked.connect(self._on_delete)
-        self.btn_run.clicked.connect(self._on_run)
-        self.btn_dry_run.clicked.connect(lambda: self._on_run("dry_run"))
-        self.btn_resume.clicked.connect(lambda: self._on_run("resume"))
-        self.btn_priority.clicked.connect(self._on_set_priority)
+        self.action_run.triggered.connect(lambda checked=False: self._on_run())
+        self.action_dry_run.triggered.connect(lambda checked=False: self._on_run("dry_run"))
+        self.action_resume.triggered.connect(lambda checked=False: self._on_run("resume"))
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_refresh.clicked.connect(self.refresh_grid)
         self.btn_theme.toggled.connect(self._on_theme_toggled)
@@ -409,6 +459,9 @@ class MainWindow(QMainWindow):
         self._apply_theme(self.theme, persist=False)
 
     # -------------------------------------------------------------- Grid
+
+    def _on_splitter_moved(self, _position: int, _index: int) -> None:
+        self._splitter_user_resized = True
 
     def refresh_grid(self):
         # ONEMLI: tablo yeniden dolduruldugunda TUM QTableWidgetItem'lar
@@ -437,16 +490,28 @@ class MainWindow(QMainWindow):
             # panelindedir (bkz. JobTaskState/_update_task_row).
             running = job.name in self.workers and self.workers[job.name].isRunning()
             last_status = "Calisiyor..." if running else (job.last_status or "-")
+            deletion_enabled = (
+                job.delete_after_transfer
+                and job.delete_policy == "verified_only"
+                and job.verification_mode in ("FullHash", "SizeOnly")
+            )
 
             values = [
-                job.name, job.source_path, job.destination_path,
-                str(job.older_than_days), str(job.delete_after_transfer),
-                "Evet" if job.enabled else "Hayir", sched, last_run, last_status,
+                str(job.priority), job.name, job.source_path, job.destination_path,
+                str(job.older_than_days), "Doğrulanınca" if deletion_enabled else "Kapalı",
+                "Evet" if job.enabled else "Hayır", sched, last_run, last_status,
             ]
             for col, val in enumerate(values):
-                item = QTableWidgetItem(val)
-                if col in (1, 2):  # Kaynak/Hedef - uzun yollar icin tooltip
+                item = PriorityTableWidgetItem(val) if col == PRIORITY_COL else QTableWidgetItem(val)
+                if col in (2, 3):  # Kaynak/Hedef - uzun yollar icin tooltip
                     item.setToolTip(val)
+                elif col == 5:
+                    item.setToolTip(
+                        "Yalnız güncel önizlemeyle eşleşen ve hedefte doğrulanan dosyalar silinir."
+                        if deletion_enabled else "Kaynak dosyalar bu job çalışmasında silinmez."
+                    )
+                elif col == PRIORITY_COL:
+                    item.setToolTip("Kuyrukta yüksek sayı önce çalışır; eşit değerlerde eklenme sırası kullanılır.")
                 if last_status == "Basarili":
                     item.setBackground(QColor(status_ok_bg(self.theme)))
                 elif last_status == "Hatali":
@@ -460,10 +525,18 @@ class MainWindow(QMainWindow):
 
         self.empty_label.setVisible(len(jobs) == 0)
         self.table.setVisible(len(jobs) > 0)
+        if not self._splitter_user_resized:
+            sizes = self.main_splitter.sizes()
+            total_height = sum(sizes)
+            if total_height > 0:
+                table_height = min(380, max(144, 78 + min(len(jobs), 9) * 32))
+                self.main_splitter.blockSignals(True)
+                self.main_splitter.setSizes([table_height, max(180, total_height - table_height)])
+                self.main_splitter.blockSignals(False)
         running_count = len(self.workers)
         queued_count = len(self.pending_jobs)
         suffix = f" ({running_count} aktif, {queued_count} kuyrukta)" if running_count or queued_count else ""
-        self.status.showMessage(f"{len(jobs)} job yuklendi.{suffix}")
+        self.status.showMessage(f"{len(jobs)} iş yüklendi.{suffix}")
 
         if selected_name is not None:
             self._select_job_by_name(selected_name)
@@ -474,14 +547,14 @@ class MainWindow(QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return None
-        item = self.table.item(row, 0)
+        item = self.table.item(row, COLUMNS.index("İş"))
         return item.text() if item else None
 
     def _select_job_by_name(self, name: str) -> None:
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
+            item = self.table.item(row, COLUMNS.index("İş"))
             if item is not None and item.text() == name:
-                self.table.setCurrentCell(row, 0)
+                self.table.setCurrentCell(row, COLUMNS.index("İş"))
                 return
 
     def _selected_job(self) -> Optional[TransferJob]:
@@ -517,14 +590,16 @@ class MainWindow(QMainWindow):
         running = bool(job) and job.name in self.workers and self.workers[job.name].isRunning()
         queued = bool(job) and job.name in self.pending_jobs
 
-        self.btn_run.setEnabled(job is not None and not running and not queued)
-        self.btn_run.setText("Calisiyor..." if running else ("Kuyrukta" if queued else "▶ Kuyruga Ekle"))
+        can_enqueue = job is not None and not running and not queued
+        self.btn_run.setEnabled(can_enqueue)
+        self.action_run.setEnabled(can_enqueue)
+        self.action_dry_run.setEnabled(can_enqueue)
+        self.action_resume.setEnabled(can_enqueue)
+        self.action_run.setText("Başlat")
         self.btn_stop.setEnabled(running or queued)
-        self.btn_stop.setText("Kuyruktan Cikar" if queued else "■ Durdur")
-        for button in (self.btn_dry_run, self.btn_resume):
-            button.setEnabled(job is not None and not running and not queued)
-        self.btn_priority.setEnabled(job is not None and not running)
-        self.btn_priority.setText(f"Oncelik: {job.priority}" if job else "Oncelik")
+        self.btn_stop.setText("Durdur")
+        self.btn_stop.setToolTip("Kuyruktaki işi iptal et" if queued else "Çalışan işi durdur")
+        self.btn_stop.setText("Kuyruktan Çıkar" if queued else "Durdur")
 
     # -------------------------------------------------------- Gorevler paneli
 
@@ -562,10 +637,9 @@ class MainWindow(QMainWindow):
         self.tasks_table.setItem(row, TASK_JOB_COL, QTableWidgetItem(job_name))
         self.tasks_table.setItem(row, TASK_STATUS_COL, QTableWidgetItem(""))
         self.tasks_table.setItem(row, TASK_STAGE_COL, QTableWidgetItem(""))
-        bar = QProgressBar()
-        bar.setRange(0, 100)
-        bar.setTextVisible(True)
-        self.tasks_table.setCellWidget(row, TASK_PROGRESS_COL, bar)
+        progress_item = QTableWidgetItem("")
+        progress_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tasks_table.setItem(row, TASK_PROGRESS_COL, progress_item)
         self.tasks_table.setItem(row, TASK_DURATION_COL, QTableWidgetItem(""))
         close_btn = QPushButton("✕")
         close_btn.setToolTip("Bu gorev satirini kapat")
@@ -596,12 +670,14 @@ class MainWindow(QMainWindow):
             stage_text = f"{stage_text} — {t.current_file}"
         self.tasks_table.item(row, TASK_STAGE_COL).setText(stage_text)
 
-        bar = self.tasks_table.cellWidget(row, TASK_PROGRESS_COL)
-        if isinstance(bar, QProgressBar):
-            elapsed = max(0.0, time.time() - t.start_time)
-            percent, progress_label = compute_task_progress(t.files_done, t.files_total, elapsed)
-            bar.setValue(percent)
-            bar.setFormat("Kuyrukta" if t.status == "queued" else (progress_label if t.files_total else "%p%"))
+        _, progress_label = compute_task_progress(t.files_done, t.files_total)
+        progress_item = self.tasks_table.item(row, TASK_PROGRESS_COL)
+        if progress_item is not None:
+            progress_item.setText("Kuyrukta" if t.status == "queued" else progress_label)
+            progress_item.setToolTip(
+                "Robocopy'nin bu çalışmada kopyaladığını bildirdiği dosya sayısı / aktarım için taranan dosya sayısı. "
+                "Hedefte zaten güncel olan dosyalar kopyalanan sayısına eklenmez."
+            )
 
         if t.status == "queued":
             duration_text = "Kuyrukta"
@@ -795,6 +871,9 @@ class MainWindow(QMainWindow):
         self.btn_theme.blockSignals(True)
         self.btn_theme.setChecked(self.theme == THEME_DARK)
         self.btn_theme.setText("Koyu Tema" if self.theme == THEME_LIGHT else "Açık Tema")
+        self.btn_theme.setMinimumWidth(
+            max(self.btn_theme.minimumWidth(), self.btn_theme.fontMetrics().horizontalAdvance(self.btn_theme.text()) + 24)
+        )
         self.btn_theme.blockSignals(False)
 
         if persist:

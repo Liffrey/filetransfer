@@ -40,6 +40,22 @@ def get_default_data_dir() -> Path:
     return Path.home() / ".datatransfertool"
 
 
+def configure_ui_font(app) -> bool:
+    """Register the Windows UI font when the bundled Qt has no font files."""
+    font_path = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "segoeui.ttf"
+    if not font_path.is_file():
+        return False
+
+    from PySide6.QtGui import QFont, QFontDatabase
+
+    font_id = QFontDatabase.addApplicationFont(str(font_path))
+    families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+    if not families:
+        return False
+    app.setFont(QFont(families[0]))
+    return True
+
+
 def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
     """Tek bir job'u headless calistirir (Gorev Zamanlayici / arka plan icin)."""
     from engine.config import JobConfigStore
@@ -67,9 +83,15 @@ def run_cli(job_name: str, config_path: str, run_id: str | None) -> int:
         sys.stdout.write(f"\r  {name[:60]:<60s} %{p.percent:5.1f}")
         sys.stdout.flush()
 
-    result = run_transfer(job, run_id=run_id, credential_store=cred_store,
-                           on_log=lambda line: print(line), lock_dir=str(data_dir / "locks"),
-                           on_progress=print_progress)
+    try:
+        result = run_transfer(job, run_id=run_id, credential_store=cred_store,
+                              on_log=lambda line: print(line), lock_dir=str(data_dir / "locks"),
+                              on_progress=print_progress)
+    except Exception as error:
+        message = f"Beklenmeyen aktarim hatasi: {type(error).__name__}: {error}"
+        print(f"HATA: {message}", file=sys.stderr)
+        config_store.update_run_result(job.name, "Hatali", message)
+        return 1
     print()  # ilerleme satirindan sonra imleci yeni satira gecir
 
     status = "Basarili" if result.overall_success else "Hatali"
@@ -92,6 +114,7 @@ def run_gui(config_path: str, cred_dir: str) -> int:
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    configure_ui_font(app)
 
     icon_path = get_app_icon_path()
     if icon_path is not None:

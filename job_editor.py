@@ -75,18 +75,26 @@ class JobEditorDialog(QDialog):
         self.age_spin = QSpinBox()
         self.age_spin.setRange(0, 3650)
         self.age_spin.setValue(30)
-        self.age_spin.setToolTip("Bu degerden DAHA ESKI dosyalar tasinir")
-        form.addRow("Yas Filtresi (gun):", self.age_spin)
+        self.age_spin.setToolTip("Bu yaştan DAHA ESKİ dosyalar aktarılır.")
+        form.addRow("Yaş Filtresi (gün):", self.age_spin)
 
         self.filter_edit = QLineEdit("*.*")
         form.addRow("Dosya Filtresi:", self.filter_edit)
 
-        self.delete_check = QCheckBox("Dogrulama basarili olursa kaynaktan sil")
-        form.addRow("Kaynagi Sil:", self.delete_check)
+        self.delete_check = QCheckBox("Doğrulanmış dosyaları kaynaktan sil")
+        self.delete_check.setToolTip(
+            "Yalnız güncel önizlemeyle eşleşen ve hedefte dosya-bazlı doğrulamadan geçen dosyalar silinir."
+        )
+        form.addRow("Kaynak Silme:", self.delete_check)
+
+        self.delete_legacy_notice = QLabel()
+        self.delete_legacy_notice.setWordWrap(True)
+        self.delete_legacy_notice.setVisible(False)
+        form.addRow("", self.delete_legacy_notice)
 
         self.dry_run_check = QCheckBox("Dry-run / onizleme modu")
         self.dry_run_check.setToolTip("Transfer gercekten yapilmaz; sadece hangi dosyalarin tasinacagini ve silinecegini onizler.")
-        form.addRow("Onizleme Modu:", self.dry_run_check)
+        form.addRow("Önizleme Modu:", self.dry_run_check)
 
         self.resume_check = QCheckBox("Robocopy /Z ile devam et")
         self.resume_check.setToolTip("Robocopy restartable modunu acar; yarim kalan buyuk dosya kopyalari surdurulebilir.")
@@ -95,23 +103,10 @@ class JobEditorDialog(QDialog):
         self.priority_spin = QSpinBox()
         self.priority_spin.setRange(-10, 100)
         self.priority_spin.setValue(0)
-        self.priority_spin.setToolTip("Daha yuksek deger, kuyrukta once islenir.")
-        form.addRow("Oncelik:", self.priority_spin)
+        self.priority_spin.setToolTip("Yüksek değer kuyrukta önce çalışır; eşit değerlerde eklenme sırası korunur.")
+        form.addRow("Öncelik:", self.priority_spin)
 
-        self.delete_policy_combo = QComboBox()
-        self.delete_policy_combo.addItem("Dogrulanan dosyalari sil (onerilen)", "verified_only")
-        self.delete_policy_combo.addItem("Kaynak dosyalara dokunma", "never")
-        self.delete_policy_combo.addItem("Tum adaylari dogrulamadan sil (engelli)", "always")
-        self.delete_policy_combo.setToolTip("Kaynak silme politikasi. Yalniz dogrulanmis dosyalar silinebilir.")
-        form.addRow("Silme Politikasi:", self.delete_policy_combo)
-
-        self.delete_policy_help = QLabel()
-        self.delete_policy_help.setWordWrap(True)
-        form.addRow("", self.delete_policy_help)
-        self.delete_policy_combo.currentIndexChanged.connect(self._update_delete_policy_help)
-        self._update_delete_policy_help()
-
-        self.require_preview_delete_check = QCheckBox("Silme oncesi onizleme zorunlu")
+        self.require_preview_delete_check = QCheckBox("Silme öncesi güncel önizleme zorunlu")
         self.require_preview_delete_check.setChecked(True)
         form.addRow("Silme Onizleme:", self.require_preview_delete_check)
 
@@ -259,15 +254,6 @@ class JobEditorDialog(QDialog):
         else:
             self.cred_combo.setCurrentText(current)
 
-    def _update_delete_policy_help(self):
-        policy = self.delete_policy_combo.currentData()
-        explanations = {
-            "verified_only": "Hedefte dosya-bazli doğrulamadan geçenler silinir. Güncel önizleme gerekir; başarısız veya eksik dosyalar kaynakta kalır.",
-            "never": "Aktarım ve doğrulama başarılı olsa bile kaynak dosyalar silinmez.",
-            "always": "Doğrulama sonucundan bağımsız tüm adayları silmek anlamına gelir. Veri kaybı riski nedeniyle desteklenmez: kaynak silme açıkken kaydetme reddedilir; eski ayarlarda da motor silmeyi engeller.",
-        }
-        self.delete_policy_help.setText(explanations.get(policy, "Bilinmeyen politika: kaynak silme engellenir."))
-
     def _on_new_credential(self):
         alias, ok = QInputDialog.getText(self, "Yeni Kimlik", "Alias adi (ornek: BackupServer01):")
         if not ok or not alias.strip():
@@ -305,13 +291,27 @@ class JobEditorDialog(QDialog):
         self.dest_edit.setText(job.destination_path)
         self.age_spin.setValue(job.older_than_days)
         self.filter_edit.setText(job.file_filter)
-        self.delete_check.setChecked(job.delete_after_transfer)
+        legacy_delete_policy = getattr(job, "delete_policy", "verified_only")
+        self.delete_check.setChecked(
+            job.delete_after_transfer and legacy_delete_policy == "verified_only"
+        )
+        if legacy_delete_policy != "verified_only":
+            if legacy_delete_policy == "never":
+                notice = (
+                    "Bu eski job kaynak silmeyi kapatan 'never' ayarını kullanıyordu. "
+                    "Silme şu an kapalı; etkinleştirmek için yukarıdaki kutuyu işaretleyin."
+                )
+            else:
+                notice = (
+                    f"Bu eski job desteklenmeyen '{legacy_delete_policy}' silme ayarını kullanıyordu. "
+                    "Veri güvenliği için silme kapatıldı; doğrulanmış dosyaları silmek istiyorsanız "
+                    "yukarıdaki kutuyu ayrıca işaretleyin."
+                )
+            self.delete_legacy_notice.setText(notice)
+            self.delete_legacy_notice.setVisible(True)
         self.dry_run_check.setChecked(job.dry_run)
         self.resume_check.setChecked(job.resume_from_checkpoint)
         self.priority_spin.setValue(job.priority)
-        idx = self.delete_policy_combo.findData(job.delete_policy)
-        if idx >= 0:
-            self.delete_policy_combo.setCurrentIndex(idx)
         self.require_preview_delete_check.setChecked(job.require_preview_for_delete)
         self.retries_spin.setValue(job.max_retries)
         self.threads_spin.setValue(job.robocopy_threads)
@@ -348,14 +348,6 @@ class JobEditorDialog(QDialog):
             return
         if not source or not dest:
             QMessageBox.warning(self, "Hata", "Kaynak ve hedef yol zorunludur.")
-            return
-        if self.delete_check.isChecked() and self.delete_policy_combo.currentData() == "always":
-            QMessageBox.warning(
-                self, "Silme Politikasi",
-                "'always', dosyalar hedefte doğrulansa da doğrulanmasa da kaynak adaylarını silmek demektir. "
-                "Bu davranış veri kaybı riski nedeniyle desteklenmiyor. 'Dogrulanan dosyalari sil' "
-                "veya 'Kaynak dosyalara dokunma' seçin.",
-            )
             return
         if not self.is_edit and name.lower() in {n.lower() for n in self.existing_names}:
             QMessageBox.warning(self, "Hata", f"Bu isimde bir job zaten var: {name}")
@@ -466,10 +458,10 @@ class JobEditorDialog(QDialog):
             older_than_days=self.age_spin.value(),
             file_filter=self.filter_edit.text().strip() or "*.*",
             delete_after_transfer=self.delete_check.isChecked(),
+            delete_policy="verified_only",
             dry_run=self.dry_run_check.isChecked(),
             resume_from_checkpoint=self.resume_check.isChecked(),
             priority=self.priority_spin.value(),
-            delete_policy=self.delete_policy_combo.currentData(),
             require_preview_for_delete=self.require_preview_delete_check.isChecked(),
             max_retries=self.retries_spin.value(),
             disk_warn_threshold_pct=self.warn_spin.value(),
